@@ -1,0 +1,1248 @@
+import tkinter as tk
+from tkinter import ttk, messagebox, font as tkfont, filedialog
+import cv2
+import threading
+import numpy as np
+import os
+import time
+from datetime import datetime
+from PIL import Image, ImageTk
+from reid import ReIDEngine, AnalyticsEngine # Ensure AnalyticsEngine is in reid.py
+
+# ==================== SETTINGS ====================
+MODEL_PATH = 'model/osnet_x0_75_imagenet.pth'
+VIDEO_1 = "./videos/cam6.2.mp4"
+VIDEO_2 = "./videos/cam1.1.mp4"
+MATCHES_DIR = "matches"
+ANALYTICS_DIR = "analytics_output"
+ZONE_ALERTS_DIR = "zone_alerts"
+# ==================================================
+
+# ==================== THEME ====================
+BG_DARK      = "#0a0e1a"
+BG_PANEL     = "#0f1628"
+BG_CARD      = "#141c30"
+BG_SURFACE   = "#1a2240"
+ACCENT_BLUE  = "#00a8ff"
+ACCENT_CYAN  = "#00e5ff"
+ACCENT_GREEN = "#00ff88"
+ACCENT_RED   = "#ff4757"
+ACCENT_AMBER = "#ffa502"
+TEXT_PRIMARY = "#e8edf5"
+TEXT_SECONDARY = "#7a8fa8"
+TEXT_DIM     = "#3d4f6b"
+BORDER       = "#1e2d4a"
+BORDER_BRIGHT= "#2a3f5f"
+# ===============================================
+
+class SentinelVision(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("SSF VISION  ·  AI Surveillance Platform")
+        self.geometry("1400x900")
+        self.minsize(1200, 750)
+        self.configure(bg=BG_DARK)
+
+
+
+        # Engines
+        self.engine = ReIDEngine(MODEL_PATH)
+        self.analytics_engine = AnalyticsEngine() # New Analytics Engine
+        from reid import ZoneEngine # Import the new engine
+        self.zone_engine = ZoneEngine()
+
+        # Global State
+        self.is_running = False
+        self.current_frame_size = (640, 480)
+        self.video_cap = None  # For zone monitoring video stream
+        self.setup_frame = None  # First frame for zone drawing
+        
+        # Re-ID State
+        self.selected_tid = None
+        self.latest_detections = []
+        self.match_queue = []
+        self.match_results = []
+        self.current_result_idx = 0
+        self.search_complete = False
+        
+        # Zoom state for results viewer
+        self.result_zoom_level = 1.0  # 1.0 = 100% fit to display
+        self.result_original_image = None  # Store original PIL image
+
+        # Directory Setup
+        os.makedirs(ANALYTICS_DIR, exist_ok=True)
+        os.makedirs(ZONE_ALERTS_DIR, exist_ok=True)
+
+        self._build_fonts()
+        self._build_layout()
+        self._start_clock()
+        self.show_page("Home")
+
+    def _build_fonts(self):
+        self.font_title  = ("Courier New", 18, "bold")
+        self.font_head   = ("Courier New", 13, "bold")
+        self.font_sub     = ("Courier New", 10)
+        self.font_mono   = ("Courier New", 9)
+        self.font_huge   = ("Courier New", 32, "bold")
+        self.font_btn    = ("Courier New", 10, "bold")
+
+    def _start_clock(self):
+        self._update_clock()
+
+    def _update_clock(self):
+        import datetime
+        now = datetime.datetime.now().strftime("%Y-%m-%d  %H:%M:%S")
+        if hasattr(self, 'clock_lbl'):
+            self.clock_lbl.config(text=now)
+        self.after(1000, self._update_clock)
+
+    def _build_layout(self):
+        topbar = tk.Frame(self, bg=BG_PANEL, height=52)
+        topbar.pack(side="top", fill="x")
+        topbar.pack_propagate(False)
+
+        logo_frame = tk.Frame(topbar, bg=BG_PANEL)
+        logo_frame.pack(side="left", padx=20)
+        tk.Label(logo_frame, text="⬡", font=("Courier New", 22, "bold"), fg=ACCENT_CYAN, bg=BG_PANEL).pack(side="left")
+        tk.Label(logo_frame, text=" SSF", font=("Courier New", 16, "bold"), fg=TEXT_PRIMARY, bg=BG_PANEL).pack(side="left")
+        tk.Label(logo_frame, text=" VISION", font=("Courier New", 16), fg=ACCENT_CYAN, bg=BG_PANEL).pack(side="left")
+
+        right = tk.Frame(topbar, bg=BG_PANEL)
+        right.pack(side="right", padx=20)
+        tk.Label(right, text="● LIVE", font=("Courier New", 9, "bold"), fg=ACCENT_GREEN, bg=BG_PANEL).pack(side="right", padx=10)
+        self.clock_lbl = tk.Label(right, font=("Courier New", 10), fg=TEXT_SECONDARY, bg=BG_PANEL, text="")
+        self.clock_lbl.pack(side="right", padx=10)
+
+        tk.Frame(self, bg=ACCENT_CYAN, height=1).pack(fill="x")
+
+        body = tk.Frame(self, bg=BG_DARK)
+        body.pack(fill="both", expand=True)
+
+        self.sidebar = tk.Frame(body, bg=BG_PANEL, width=220)
+        self.sidebar.pack(side="left", fill="y")
+        self.sidebar.pack_propagate(False)
+        self._build_sidebar()
+
+        tk.Frame(body, bg=BORDER, width=1).pack(side="left", fill="y")
+
+        self.content = tk.Frame(body, bg=BG_DARK)
+        self.content.pack(side="right", fill="both", expand=True)
+
+        self.home_page      = tk.Frame(self.content, bg=BG_DARK)
+        self.reid_page      = tk.Frame(self.content, bg=BG_DARK)
+        self.analytics_page = tk.Frame(self.content, bg=BG_DARK)
+        self.zone_page      = tk.Frame(self.content, bg=BG_DARK)
+        self.results_page   = tk.Frame(self.content, bg=BG_DARK)
+
+        self._build_home_page()
+        self._build_reid_page()
+        self._build_analytics_page()
+        self._build_zone_page()
+        self._build_results_page()
+
+    def _build_sidebar(self):
+        tk.Frame(self.sidebar, bg=BG_PANEL, height=20).pack()
+        tk.Label(self.sidebar, text="NAVIGATION", font=("Courier New", 7, "bold"), fg=TEXT_DIM, bg=BG_PANEL).pack(anchor="w", padx=18, pady=(10, 4))
+
+        nav_items = [
+            ("Home",      "⌂", "Dashboard"),
+            ("ReID",      "◉", "Person Re-ID"),
+            ("Analytics", "📊", "People Analytics"),
+            ("Zones",     "🚫", "Restricted Zones"), # Add this
+            ("Results",   "▦", "Match Results"),
+        ]
+        self.nav_btns = {}
+        for key, icon, label in nav_items:
+            btn = self._nav_button(self.sidebar, icon, label, command=lambda k=key: self.show_page(k))
+            self.nav_btns[key] = btn
+
+        # --- Session Status Section ---
+        tk.Frame(self.sidebar, bg=BORDER, height=1).pack(fill="x", padx=15, pady=15)
+        tk.Label(self.sidebar, text="SESSION", font=("Courier New", 7, "bold"), fg=TEXT_DIM, bg=BG_PANEL).pack(anchor="w", padx=18, pady=(0, 8))
+        self.status_dot = tk.Label(self.sidebar, text="● IDLE", font=("Courier New", 9, "bold"), fg=TEXT_DIM, bg=BG_PANEL)
+        self.status_dot.pack(anchor="w", padx=18)
+        self.sidebar_status = tk.Label(self.sidebar, text="No active operation", font=("Courier New", 8), fg=TEXT_SECONDARY, bg=BG_PANEL, wraplength=180, justify="left")
+        self.sidebar_status.pack(anchor="w", padx=18, pady=(4, 0))
+
+        # --- MATCH COUNTER SECTION (FIXES THE ERROR) ---
+        tk.Frame(self.sidebar, bg=BORDER, height=1).pack(fill="x", padx=15, pady=15)
+        tk.Label(self.sidebar, text="MATCHES FOUND", font=("Courier New", 7, "bold"), fg=TEXT_DIM, bg=BG_PANEL).pack(anchor="w", padx=18, pady=(0, 4))
+        
+        self.match_count_lbl = tk.Label(self.sidebar, text="0", font=("Courier New", 28, "bold"), fg=ACCENT_CYAN, bg=BG_PANEL)
+        self.match_count_lbl.pack(anchor="w", padx=18)
+
+        # --- View Results Button ---
+        tk.Frame(self.sidebar, bg=BORDER, height=1).pack(fill="x", padx=15, pady=15)
+        self.view_results_btn = tk.Button(self.sidebar, text="▶  VIEW RESULTS", font=self.font_btn, bg=ACCENT_CYAN, fg=BG_DARK, relief="flat", pady=8, cursor="hand2", command=lambda: self.show_page("Results"))
+        # We don't pack it yet; it will be shown by _on_search_complete when matches exist
+
+    def _nav_button(self, parent, icon, label, command):
+        frame = tk.Frame(parent, bg=BG_PANEL, cursor="hand2")
+        frame.pack(fill="x", padx=10, pady=2)
+        icon_l = tk.Label(frame, text=icon, font=("Courier New", 12), fg=TEXT_SECONDARY, bg=BG_PANEL, width=3)
+        icon_l.pack(side="left")
+        text_l = tk.Label(frame, text=label, font=("Courier New", 11), fg=TEXT_SECONDARY, bg=BG_PANEL, anchor="w")
+        text_l.pack(side="left", fill="x", expand=True, pady=8)
+        
+        for w in (frame, icon_l, text_l):
+            w.bind("<Button-1>", lambda e, c=command: c())
+        frame._icon, frame._text = icon_l, text_l
+        return frame
+
+    def _set_active_nav(self, key):
+        for k, frame in self.nav_btns.items():
+            active = (k == key)
+            bg = BG_SURFACE if active else BG_PANEL
+            frame.config(bg=bg)
+            frame._icon.config(bg=bg, fg=ACCENT_CYAN if active else TEXT_SECONDARY)
+            frame._text.config(bg=bg, fg=TEXT_PRIMARY if active else TEXT_SECONDARY)
+
+    # ------------------------------------------------------------------ #
+    #  ANALYTICS PAGE UI                                                 #
+    # ------------------------------------------------------------------ #
+    def _build_analytics_page(self):
+        p = self.analytics_page
+        hdr = tk.Frame(p, bg=BG_DARK)
+        hdr.pack(fill="x", padx=25, pady=(20, 10))
+        tk.Label(hdr, text="PEOPLE COUNTING & HEATMAPS", font=("Courier New", 16, "bold"), fg=TEXT_PRIMARY, bg=BG_DARK).pack(side="left")
+        tk.Frame(p, bg=BORDER, height=1).pack(fill="x", padx=25)
+
+        main_cols = tk.Frame(p, bg=BG_DARK)
+        main_cols.pack(fill="both", expand=True, padx=25, pady=15)
+
+        # --- RIGHT SIDEBAR (Control Panel) ---
+        # Pack FIRST
+        right_col = tk.Frame(main_cols, bg=BG_DARK, width=320)
+        right_col.pack(side="right", fill="y", padx=(20, 0))
+        right_col.pack_propagate(False)
+
+        # (Existing widgets inside right_col)
+        tk.Label(right_col, text="DATA SOURCE", font=self.font_head, fg=ACCENT_CYAN, bg=BG_DARK).pack(pady=(0, 10))
+        tk.Button(right_col, text="📁 LOAD VIDEO FILE", font=self.font_btn, bg=BG_CARD, fg=TEXT_PRIMARY, pady=10, command=self.select_analytics_video).pack(fill="x", pady=5)
+        tk.Button(right_col, text="📷 START WEBCAM", font=self.font_btn, bg=BG_CARD, fg=TEXT_PRIMARY, pady=10, command=lambda: self.start_analytics(0)).pack(fill="x", pady=5)
+
+        tk.Frame(right_col, bg=BORDER, height=1).pack(fill="x", pady=20)
+        self.ana_count_lbl = tk.Label(right_col, text="CURRENT: 0", font=("Courier New", 14, "bold"), fg=ACCENT_GREEN, bg=BG_PANEL, pady=15)
+        self.ana_count_lbl.pack(fill="x", pady=5)
+        self.ana_peak_lbl = tk.Label(right_col, text="PEAK: 0", font=("Courier New", 12), fg=TEXT_SECONDARY, bg=BG_PANEL, pady=15)
+        self.ana_peak_lbl.pack(fill="x", pady=5)
+
+        self.stop_ana_btn = tk.Button(right_col, text="■ STOP & SAVE REPORT", font=self.font_btn, bg=ACCENT_RED, fg=TEXT_PRIMARY, pady=15, state="disabled", command=self.stop_analytics)
+        self.stop_ana_btn.pack(side="bottom", fill="x", pady=20)
+
+        # --- LEFT AREA (Video Feed) ---
+        # Pack SECOND
+        left_col = tk.Frame(main_cols, bg=BG_DARK)
+        left_col.pack(side="left", fill="both", expand=True)
+        
+        ana_feed_wrap = tk.Frame(left_col, bg=BG_CARD, highlightthickness=1, highlightbackground=BORDER_BRIGHT)
+        ana_feed_wrap.pack(fill="both", expand=True)
+        self.ana_vid_label = tk.Label(ana_feed_wrap, bg="#040810", text="[ SELECT INPUT SOURCE ]", font=self.font_head, fg=TEXT_DIM)
+        self.ana_vid_label.pack(fill="both", expand=True, padx=4, pady=4)
+    
+    def _apply_image_to_label(self, cv_frame, label):
+        """Standardized image update for all video labels."""
+        # Detect current size of the label widget
+        lw = label.winfo_width()
+        lh = label.winfo_height()
+        
+        # Fallback for initial state before window is rendered
+        if lw < 10 or lh < 10:
+            lw, lh = 800, 450
+            
+        img = Image.fromarray(cv2.cvtColor(cv_frame, cv2.COLOR_BGR2RGB)).resize((lw, lh))
+        img_tk = ImageTk.PhotoImage(img)
+        label.config(image=img_tk, text="")
+        label._img_tk = img_tk
+
+    # ------------------------------------------------------------------ #
+    #  ANALYTICS LOGIC                                                   #
+    # ------------------------------------------------------------------ #
+    def select_analytics_video(self):
+        file_path = filedialog.askopenfilename(filetypes=[("Video files", "*.mp4 *.avi *.mkv")])
+        if file_path:
+            self.start_analytics(file_path)
+
+    def start_analytics(self, source):
+        self.is_running = True
+        self.stop_ana_btn.config(state="normal")
+        self._set_sidebar_status("searching", "Analytics session active")
+        threading.Thread(target=self.run_analytics_loop, args=(source,), daemon=True).start()
+
+    def run_analytics_loop(self, source):
+        cap = cv2.VideoCapture(source)
+        ret, first_frame = cap.read()
+        if not ret:
+            self.is_running = False
+            return
+        
+        self.analytics_engine.reset(first_frame.shape)
+        
+        while cap.isOpened() and self.is_running:
+            ret, frame = cap.read()
+            if not ret: break
+
+            # Keep a copy of the last frame (backwards compatible name + new one)
+            self.last_valid_frame = frame.copy()
+            self.last_ana_frame = frame.copy()
+
+            processed, count = self.analytics_engine.process_analytics_frame(frame)
+
+            # Update stats on the main thread
+            self.after(0, lambda c=count: self.ana_count_lbl.config(text=f"CURRENT: {c}"))
+            self.after(0, lambda p=self.analytics_engine.max_count: self.ana_peak_lbl.config(text=f"PEAK: {p}"))
+
+            # Update video display using centralized helper
+            self.after(0, self._apply_image_to_label, processed, self.ana_vid_label)
+        
+        cap.release()
+
+    def _update_ana_display(self, frame, count):
+        self.ana_curr_lbl.config(text=f"CURRENT: {count}")
+        self.ana_peak_lbl.config(text=f"PEAK: {self.analytics_engine.max_count}")
+        
+        lw, lh = self.ana_vid_label.winfo_width(), self.ana_vid_label.winfo_height()
+        if lw < 10: lw, lh = 800, 450
+        
+        img = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)).resize((lw, lh))
+        img_tk = ImageTk.PhotoImage(img)
+        self.ana_vid_label.config(image=img_tk, text="")
+        self.ana_vid_label._img_tk = img_tk
+
+    def stop_analytics(self):
+        self.is_running = False
+        self.stop_ana_btn.config(state="disabled")
+        self._set_sidebar_status("done", "Analytics report generated")
+
+        # Create final heatmap
+        if hasattr(self, 'last_valid_frame'):
+            final_heatmap = self.analytics_engine.get_final_heatmap(self.last_valid_frame)
+            save_path = os.path.join(ANALYTICS_DIR, f"heatmap_{int(time.time())}.png")
+            cv2.imwrite(save_path, final_heatmap)
+            
+            # Show final result in a new window or as a popup
+            self.show_final_heatmap_popup(final_heatmap, save_path)
+
+    def show_final_heatmap_popup(self, cv_img, path):
+        top = tk.Toplevel(self)
+        top.title("Session Report - People Density")
+        top.configure(bg=BG_DARK)
+        
+        img = Image.fromarray(cv2.cvtColor(cv_img, cv2.COLOR_BGR2RGB))
+        img.thumbnail((1000, 700))
+        img_tk = ImageTk.PhotoImage(img)
+        
+        lbl = tk.Label(top, image=img_tk, bg=BG_DARK)
+        lbl.image = img_tk
+        lbl.pack(padx=20, pady=20)
+        
+        tk.Label(top, text=f"Report saved to: {path}", fg=ACCENT_GREEN, bg=BG_DARK, font=self.font_mono).pack(pady=(0, 20))
+
+    # ------------------------------------------------------------------ #
+    #  EXISTING MODULES (RE-ID, HOME, RESULTS)                           #
+    # ------------------------------------------------------------------ #
+    
+    
+    def _build_home_page(self):
+        p = self.home_page
+
+        # --- Header Section ---
+        hdr = tk.Frame(p, bg=BG_DARK)
+        hdr.pack(fill="x", padx=30, pady=(30, 0))
+        tk.Label(hdr, text="SYSTEM COMMAND CENTER",
+                 font=("Courier New", 22, "bold"), fg=TEXT_PRIMARY, bg=BG_DARK).pack(anchor="w")
+        tk.Label(hdr, text="Multi-module AI Surveillance & Behavioral Intelligence Platform",
+                 font=("Courier New", 10), fg=ACCENT_CYAN, bg=BG_DARK).pack(anchor="w", pady=(4, 0))
+        tk.Frame(p, bg=BORDER, height=1).pack(fill="x", padx=30, pady=20)
+
+        # --- Module Overview Cards ---
+        cards_row = tk.Frame(p, bg=BG_DARK)
+        cards_row.pack(fill="x", padx=30, pady=(0, 20))
+
+        modules = [
+            ("PERSON RE-ID", "Identify and track specific targets across multiple camera feeds.", ACCENT_BLUE, "◉"),
+            ("HEATMAP ANALYTICS", "Visualize crowd density, traffic flow, and loitering hotspots.", ACCENT_AMBER, "📊"),
+            ("RESTRICTED ZONES", "Define virtual boundaries and trigger instant intrusion alerts.", ACCENT_RED, "🚫"),
+        ]
+
+        for title, desc, color, icon in modules:
+            card = tk.Frame(cards_row, bg=BG_CARD, highlightbackground=BORDER, highlightthickness=1)
+            card.pack(side="left", padx=8, pady=4, fill="both", expand=True)
+            
+            inner = tk.Frame(card, bg=BG_CARD)
+            inner.pack(padx=20, pady=20)
+            
+            tk.Label(inner, text=icon, font=("Courier New", 28), fg=color, bg=BG_CARD).pack(anchor="w")
+            tk.Label(inner, text=title, font=("Courier New", 13, "bold"), fg=TEXT_PRIMARY, bg=BG_CARD).pack(anchor="w", pady=(10, 5))
+            tk.Label(inner, text=desc, font=("Courier New", 9), fg=TEXT_SECONDARY, bg=BG_CARD, wraplength=250, justify="left").pack(anchor="w")
+
+        # --- Quick Launch Section ---
+        launch_section = tk.Frame(p, bg=BG_DARK)
+        launch_section.pack(fill="both", expand=True, padx=30, pady=10)
+        
+        tk.Label(launch_section, text="QUICK LAUNCH MODULES", font=("Courier New", 11, "bold"),
+                 fg=TEXT_DIM, bg=BG_DARK).pack(anchor="w", pady=(0, 15))
+
+        launch_grid = tk.Frame(launch_section, bg=BG_DARK)
+        launch_grid.pack(fill="x")
+
+        # Launch Buttons Data
+        buttons = [
+            ("Launch Re-ID Engine", "ReID", ACCENT_BLUE),
+            ("Open Heatmap Dashboard", "Analytics", ACCENT_AMBER),
+            ("Configure Security Zones", "Zones", ACCENT_RED),
+            ("View Search Results", "Results", TEXT_SECONDARY)
+        ]
+
+        # Arrange buttons in a 2x2 grid
+        for i, (text, page, color) in enumerate(buttons):
+            row, col = divmod(i, 2)
+            btn_frame = tk.Frame(launch_grid, bg=BG_DARK)
+            btn_frame.grid(row=row, column=col, sticky="nsew", padx=5, pady=5)
+            launch_grid.columnconfigure(col, weight=1)
+
+            tk.Button(btn_frame, text=f"  {text}  →",
+                      font=("Courier New", 11, "bold"),
+                      bg=BG_SURFACE, fg=color,
+                      activebackground=color, activeforeground=BG_DARK,
+                      relief="flat", cursor="hand2", pady=15, anchor="w",
+                      highlightbackground=BORDER, highlightthickness=1,
+                      command=lambda p=page: self.show_page(p)).pack(fill="x")
+
+        # --- System Specs Footer ---
+        footer = tk.Frame(p, bg=BG_DARK)
+        footer.pack(side="bottom", fill="x", padx=30, pady=20)
+        specs = f"ENGINE: YOLOv8n | BACKBONE: OSNet x0_75 | DEVICE: {self.engine.device.upper()}"
+        tk.Label(footer, text=specs, font=("Courier New", 8), fg=TEXT_DIM, bg=BG_DARK).pack(side="left")
+        tk.Label(footer, text="v2.1.0-STABLE", font=("Courier New", 8), fg=TEXT_DIM, bg=BG_DARK).pack(side="right")
+        
+    # ------------------------------------------------------------------ #
+    #  RE-ID PAGE                                                          #
+    # ------------------------------------------------------------------ #
+    def _build_reid_page(self):
+        p = self.reid_page
+        hdr = tk.Frame(p, bg=BG_DARK)
+        hdr.pack(fill="x", padx=25, pady=(20, 10))
+        tk.Label(hdr, text="PERSON RE-IDENTIFICATION", font=("Courier New", 16, "bold"), fg=TEXT_PRIMARY, bg=BG_DARK).pack(side="left")
+        self.phase_lbl = tk.Label(hdr, text="[ PHASE 1: TARGET SELECTION ]", font=("Courier New", 10, "bold"), fg=ACCENT_AMBER, bg=BG_DARK)
+        self.phase_lbl.pack(side="right")
+        tk.Frame(p, bg=BORDER, height=1).pack(fill="x", padx=25)
+
+        cols = tk.Frame(p, bg=BG_DARK)
+        cols.pack(fill="both", expand=True, padx=25, pady=15)
+
+        # --- RIGHT SIDEBAR (Control Panel) ---
+        right_col = tk.Frame(cols, bg=BG_DARK, width=320) 
+        right_col.pack(side="right", fill="y", padx=(15, 0))
+        right_col.pack_propagate(False) 
+
+        # Operation Status
+        status_card = tk.Frame(right_col, bg=BG_CARD, highlightthickness=1, highlightbackground=BORDER)
+        status_card.pack(fill="x", pady=(0, 12))
+        tk.Label(status_card, text="OPERATION STATUS", font=self.font_mono, fg=TEXT_SECONDARY, bg=BG_SURFACE).pack(fill="x", pady=6)
+        self.status_lbl = tk.Label(status_card, text="Awaiting start...", font=self.font_sub, fg=TEXT_SECONDARY, bg=BG_CARD, wraplength=280)
+        self.status_lbl.pack(pady=10, padx=10)
+
+        # Progress Bar
+        prog_card = tk.Frame(right_col, bg=BG_CARD, highlightthickness=1, highlightbackground=BORDER)
+        prog_card.pack(fill="x", pady=(0, 12))
+        tk.Label(prog_card, text="SEARCH PROGRESS", font=self.font_mono, fg=TEXT_SECONDARY, bg=BG_SURFACE).pack(fill="x", pady=6)
+        self.prog_bar = ttk.Progressbar(prog_card, orient="horizontal", mode="determinate")
+        self.prog_bar.pack(fill="x", padx=15, pady=10)
+        self.prog_pct_lbl = tk.Label(prog_card, text="0%", font=self.font_mono, fg=TEXT_DIM, bg=BG_CARD)
+        self.prog_pct_lbl.pack(pady=(0, 5))
+
+        # Matches Count (THIS WAS MISSING)
+        match_card = tk.Frame(right_col, bg=BG_CARD, highlightthickness=1, highlightbackground=BORDER)
+        match_card.pack(fill="x", pady=(0, 12))
+        tk.Label(match_card, text="MATCHES DETECTED", font=self.font_mono, fg=TEXT_SECONDARY, bg=BG_SURFACE).pack(fill="x", pady=6)
+        self.live_match_lbl = tk.Label(match_card, text="0", font=("Courier New", 26, "bold"), fg=ACCENT_GREEN, bg=BG_CARD)
+        self.live_match_lbl.pack(pady=10)
+
+        # Tracked ID
+        lock_card = tk.Frame(right_col, bg=BG_CARD, highlightthickness=1, highlightbackground=BORDER)
+        lock_card.pack(fill="x", pady=(0, 12))
+        tk.Label(lock_card, text="TRACKED ID", font=self.font_mono, fg=TEXT_SECONDARY, bg=BG_SURFACE).pack(fill="x", pady=6)
+        self.locked_id_lbl = tk.Label(lock_card, text="—", font=self.font_huge, fg=ACCENT_AMBER, bg=BG_CARD)
+        self.locked_id_lbl.pack(pady=10)
+
+        # Button Frame for Start/Stop
+        btn_frame = tk.Frame(right_col, bg=BG_DARK)
+        btn_frame.pack(fill="x", side="bottom", pady=(10, 0))
+
+        self.stop_reid_btn = tk.Button(btn_frame, text="■ STOP REID", font=self.font_btn, bg=ACCENT_RED, fg=TEXT_PRIMARY, pady=12, state="disabled", command=self.stop_reid)
+        self.stop_reid_btn.pack(fill="x", pady=(0, 8))
+
+        self.start_btn = tk.Button(btn_frame, text="▶ START PHASE 1", font=self.font_btn, bg=ACCENT_GREEN, fg=BG_DARK, pady=12, command=self.start_p1)
+        self.start_btn.pack(fill="x")
+
+        # --- LEFT AREA (Video Feed) ---
+        left_col = tk.Frame(cols, bg=BG_DARK)
+        left_col.pack(side="left", fill="both", expand=True)
+        
+        feed_wrap = tk.Frame(left_col, bg=BG_CARD, highlightthickness=1, highlightbackground=BORDER_BRIGHT)
+        feed_wrap.pack(fill="both", expand=True)
+        self.vid_label = tk.Label(feed_wrap, bg="#040810", text="[ VIDEO FEED INACTIVE ]", font=self.font_title, fg=TEXT_DIM)
+        self.vid_label.pack(fill="both", expand=True, padx=4, pady=4)
+        self.vid_label.bind("<Button-1>", self.handle_click)
+
+    def _update_gallery_bars(self):
+        count = len(self.engine.target_gallery)
+        for i, bar in enumerate(self.gallery_bars):
+            bar.config(bg=ACCENT_CYAN if i < count else TEXT_DIM)
+        self.gallery_count_lbl.config(text=f"{count} / 15 samples")
+        if count > 0:
+            self.gallery_count_lbl.config(fg=ACCENT_CYAN)
+        self.after(200, self._update_gallery_bars)
+
+    # ------------------------------------------------------------------ #
+    #  RESULTS PAGE                                                        #
+    # ------------------------------------------------------------------ #
+    def _build_results_page(self):
+        p = self.results_page
+
+        # Header
+        hdr = tk.Frame(p, bg=BG_DARK)
+        hdr.pack(fill="x", padx=25, pady=(20, 10))
+        tk.Label(hdr, text="MATCH RESULTS VIEWER",
+                 font=("Courier New", 16, "bold"), fg=TEXT_PRIMARY, bg=BG_DARK).pack(side="left")
+        self.result_counter_lbl = tk.Label(hdr, text="", font=("Courier New", 10),
+                                            fg=TEXT_SECONDARY, bg=BG_DARK)
+        self.result_counter_lbl.pack(side="right")
+        tk.Frame(p, bg=BORDER, height=1).pack(fill="x", padx=25)
+
+        # Main content
+        main = tk.Frame(p, bg=BG_DARK)
+        main.pack(fill="both", expand=True, padx=25, pady=20)
+
+        # Left: Image viewer
+        left = tk.Frame(main, bg=BG_DARK)
+        left.pack(side="left", fill="both", expand=True)
+
+        img_card = tk.Frame(left, bg=BG_CARD, highlightbackground=BORDER_BRIGHT,
+                            highlightthickness=1)
+        img_card.pack(fill="both", expand=True)
+
+        img_topbar = tk.Frame(img_card, bg=BG_SURFACE)
+        img_topbar.pack(fill="x")
+        tk.Label(img_topbar, text="▦ MATCH PREVIEW",
+                 font=("Courier New", 9, "bold"), fg=ACCENT_CYAN,
+                 bg=BG_SURFACE).pack(side="left", padx=12, pady=6)
+
+        self.result_img_lbl = tk.Label(img_card, bg="#040810",
+                                        text="[ NO RESULTS ]",
+                                        font=("Courier New", 14), fg=TEXT_DIM)
+        self.result_img_lbl.pack(fill="both", expand=True, padx=8, pady=8)
+        
+        # Bind keyboard shortcuts for zoom
+        self.result_img_lbl.bind("<Key-plus>", lambda e: self.zoom_in_result())
+        self.result_img_lbl.bind("<Key-minus>", lambda e: self.zoom_out_result())
+        self.result_img_lbl.bind("<Key-equal>", lambda e: self.zoom_in_result())  # Shift+= on US keyboard
+        self.result_img_lbl.bind("<MouseWheel>", self._on_results_mousewheel)  # Windows scroll
+        self.result_img_lbl.bind("<Button-4>", self._on_results_mousewheel)  # Linux scroll up
+        self.result_img_lbl.bind("<Button-5>", self._on_results_mousewheel)  # Linux scroll down
+
+        # Nav bar
+        nav_bar = tk.Frame(left, bg=BG_DARK)
+        nav_bar.pack(fill="x", pady=(12, 0))
+
+        self.prev_btn = tk.Button(nav_bar, text="◀  PREVIOUS",
+                                   font=("Courier New", 11, "bold"),
+                                   bg=BG_CARD, fg=TEXT_PRIMARY,
+                                   relief="flat", cursor="hand2",
+                                   pady=10, padx=20,
+                                   highlightbackground=BORDER, highlightthickness=1,
+                                   command=self.show_prev_result)
+        self.prev_btn.pack(side="left")
+
+        self.nav_pos_lbl = tk.Label(nav_bar, text="0 / 0",
+                                     font=("Courier New", 12, "bold"),
+                                     fg=TEXT_SECONDARY, bg=BG_DARK)
+        self.nav_pos_lbl.pack(side="left", expand=True)
+
+        self.next_btn = tk.Button(nav_bar, text="NEXT  ▶",
+                                   font=("Courier New", 11, "bold"),
+                                   bg=BG_CARD, fg=TEXT_PRIMARY,
+                                   relief="flat", cursor="hand2",
+                                   pady=10, padx=20,
+                                   highlightbackground=BORDER, highlightthickness=1,
+                                   command=self.show_next_result)
+        self.next_btn.pack(side="right")
+
+        # --- ZOOM CONTROLS ROW ---
+        zoom_bar = tk.Frame(left, bg=BG_DARK)
+        zoom_bar.pack(fill="x", pady=(8, 0))
+
+        tk.Label(zoom_bar, text="ZOOM:", font=("Courier New", 10, "bold"),
+                 fg=TEXT_SECONDARY, bg=BG_DARK).pack(side="left", padx=5)
+
+        self.zoom_out_btn = tk.Button(zoom_bar, text="−  ZOOM OUT",
+                                        font=("Courier New", 10, "bold"),
+                                        bg=BG_CARD, fg=TEXT_PRIMARY,
+                                        relief="flat", cursor="hand2",
+                                        pady=8, padx=15,
+                                        highlightbackground=BORDER, highlightthickness=1,
+                                        command=self.zoom_out_result)
+        self.zoom_out_btn.pack(side="left", padx=5)
+
+        self.zoom_lbl = tk.Label(zoom_bar, text="100%",
+                                  font=("Courier New", 10, "bold"),
+                                  fg=ACCENT_CYAN, bg=BG_DARK, width=8)
+        self.zoom_lbl.pack(side="left", padx=5)
+
+        self.zoom_in_btn = tk.Button(zoom_bar, text="ZOOM IN  +",
+                                       font=("Courier New", 10, "bold"),
+                                       bg=BG_CARD, fg=TEXT_PRIMARY,
+                                       relief="flat", cursor="hand2",
+                                       pady=8, padx=15,
+                                       highlightbackground=BORDER, highlightthickness=1,
+                                       command=self.zoom_in_result)
+        self.zoom_in_btn.pack(side="left", padx=5)
+
+        self.reset_zoom_btn = tk.Button(zoom_bar, text="RESET",
+                                          font=("Courier New", 10, "bold"),
+                                          bg=BG_CARD, fg=TEXT_SECONDARY,
+                                          relief="flat", cursor="hand2",
+                                          pady=8, padx=12,
+                                          highlightbackground=BORDER, highlightthickness=1,
+                                          command=self.reset_zoom)
+        self.reset_zoom_btn.pack(side="left", padx=5)
+
+        # Right: Metadata panel
+        right = tk.Frame(main, bg=BG_DARK, width=300)
+        right.pack(side="right", fill="y", padx=(20, 0))
+        right.pack_propagate(False)
+
+        meta_card = tk.Frame(right, bg=BG_CARD, highlightbackground=BORDER,
+                             highlightthickness=1)
+        meta_card.pack(fill="x", pady=(0, 12))
+        tk.Label(meta_card, text="MATCH METADATA",
+                 font=("Courier New", 9, "bold"), fg=TEXT_SECONDARY,
+                 bg=BG_SURFACE).pack(fill="x", padx=12, pady=6)
+
+        meta_inner = tk.Frame(meta_card, bg=BG_CARD)
+        meta_inner.pack(fill="x", padx=12, pady=12)
+
+        self.meta_fields = {}
+        for key, label in [("video", "SOURCE FILE"), ("timestamp", "TIMESTAMP"),
+                            ("index", "MATCH INDEX"), ("saved", "SAVED TO")]:
+            tk.Label(meta_inner, text=label, font=("Courier New", 8, "bold"),
+                     fg=TEXT_DIM, bg=BG_CARD).pack(anchor="w", pady=(6, 0))
+            val_lbl = tk.Label(meta_inner, text="—", font=("Courier New", 10),
+                               fg=TEXT_PRIMARY, bg=BG_CARD, wraplength=240,
+                               justify="left", anchor="w")
+            val_lbl.pack(anchor="w")
+            self.meta_fields[key] = val_lbl
+
+        # Summary card
+        summary_card = tk.Frame(right, bg=BG_CARD, highlightbackground=BORDER,
+                                highlightthickness=1)
+        summary_card.pack(fill="x", pady=(0, 12))
+        tk.Label(summary_card, text="SESSION SUMMARY",
+                 font=("Courier New", 9, "bold"), fg=TEXT_SECONDARY,
+                 bg=BG_SURFACE).pack(fill="x", padx=12, pady=6)
+
+        sum_inner = tk.Frame(summary_card, bg=BG_CARD)
+        sum_inner.pack(fill="x", padx=12, pady=12)
+
+        for key, label in [("total_matches", "TOTAL MATCHES"),
+                            ("save_dir", "SAVE DIRECTORY"),
+                            ("threshold", "MATCH THRESHOLD")]:
+            tk.Label(sum_inner, text=label, font=("Courier New", 8, "bold"),
+                     fg=TEXT_DIM, bg=BG_CARD).pack(anchor="w", pady=(6, 0))
+            val = {"total_matches": "0",
+                   "save_dir": f"./{MATCHES_DIR}/",
+                   "threshold": "> 0.75 cosine sim"}.get(key, "—")
+            lbl = tk.Label(sum_inner, text=val, font=("Courier New", 10),
+                           fg=TEXT_PRIMARY, bg=BG_CARD, anchor="w")
+            lbl.pack(anchor="w")
+            if key == "total_matches":
+                self.results_total_lbl = lbl
+
+        # Back button
+        tk.Button(right, text="◀  BACK TO TRACKING",
+                  font=("Courier New", 10, "bold"),
+                  bg=BG_CARD, fg=TEXT_SECONDARY,
+                  relief="flat", cursor="hand2",
+                  pady=10,
+                  highlightbackground=BORDER, highlightthickness=1,
+                  command=lambda: self.show_page("ReID")).pack(fill="x")
+        
+    def show_page(self, name):
+        self.is_running = False # Gracefully stop active threads
+        
+        # Hide all frames
+        for page in [self.home_page, self.reid_page, self.analytics_page, 
+                     self.zone_page, self.results_page]:
+            page.pack_forget()
+
+        self._set_active_nav(name)
+
+        # Show selected frame
+        if name == "Home": 
+            self.home_page.pack(fill="both", expand=True)
+        elif name == "ReID": 
+            self.reid_page.pack(fill="both", expand=True)
+        elif name == "Analytics": 
+            self.analytics_page.pack(fill="both", expand=True)
+        elif name == "Zones": 
+            self.zone_page.pack(fill="both", expand=True)
+        elif name == "Results": 
+            self.results_page.pack(fill="both", expand=True)
+            self._refresh_results_page()
+    # ------------------------------------------------------------------ #
+    #  CLICK HANDLING                                                      #
+    # ------------------------------------------------------------------ #
+    def handle_click(self, event):
+        if not self.latest_detections:
+            return
+
+        label_w = self.vid_label.winfo_width()
+        label_h = self.vid_label.winfo_height()
+        orig_w, orig_h = self.current_frame_size
+        real_x = event.x * (orig_w / label_w)
+        real_y = event.y * (orig_h / label_h)
+
+        for (xyxy, tid) in self.latest_detections:
+            x1, y1, x2, y2 = xyxy
+            if x1 <= real_x <= x2 and y1 <= real_y <= y2:
+                self.selected_tid = tid
+                self.engine.target_gallery = []
+                self.locked_id_lbl.config(text=f"#{tid}", fg=ACCENT_AMBER)
+                self._set_status(f"Locked on ID #{tid} — collecting features...", ACCENT_AMBER)
+                self._set_sidebar_status("active", f"Collecting features for ID #{tid}")
+                break
+
+    # ------------------------------------------------------------------ #
+    #  PHASE 1 – SELECTION                                                 #
+    # ------------------------------------------------------------------ #
+    def start_p1(self):
+        # Complete local state reset
+        self.is_running = True
+        self.search_complete = False
+        self.match_results = []
+        self.match_queue = []
+        self.selected_tid = None
+        self.latest_detections = []
+        self.current_result_idx = 0
+        
+        # Full engine reset before starting
+        self.engine.full_reset()
+        
+        # Reset UI Elements
+        self.locked_id_lbl.config(text="—")
+        self.phase_lbl.config(text="[ PHASE 1: TARGET SELECTION ]", fg=ACCENT_AMBER)
+        self.start_btn.config(state="disabled", bg=TEXT_DIM)
+        self.stop_reid_btn.config(state="normal")
+        
+        # Safe config for labels that might have different names
+        if hasattr(self, 'live_match_lbl'): self.live_match_lbl.config(text="0")
+        if hasattr(self, 'match_count_lbl'): self.match_count_lbl.config(text="0")
+        
+        # Reset progress bar explicitly
+        self.prog_bar.config(value=0)
+        self.prog_pct_lbl.config(text="0%", fg=TEXT_DIM)
+        
+        self._set_status("Initializing camera... please click target person.")
+        self._set_sidebar_status("active", "Phase 1: Selecting Target")
+        
+        # Small delay to ensure UI updates before thread starts
+        self.after(100, lambda: threading.Thread(target=self.run_p1_loop, daemon=True).start())
+
+    def run_p1_loop(self):
+        cap = cv2.VideoCapture(VIDEO_1)
+        self.current_frame_size = (int(cap.get(3)), int(cap.get(4)))
+
+        while cap.isOpened() and self.is_running:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            if len(self.engine.target_gallery) >= 15:
+                break
+
+            processed, detections = self.engine.process_frame(frame, self.selected_tid)
+            self.latest_detections = detections
+
+            if self.selected_tid is not None:
+                for xyxy, tid in detections:
+                    if tid == self.selected_tid:
+                        x1, y1, x2, y2 = map(int, xyxy)
+                        crop = frame[y1:y2, x1:x2]
+                        feat = self.engine.get_features(crop)
+                        if feat is not None:
+                            self.engine.target_gallery.append(feat)
+
+            # Use centralized image helper to keep sizing consistent
+            self.after(0, self._apply_image_to_label, processed, self.vid_label)
+
+        cap.release()
+        if len(self.engine.target_gallery) >= 15:
+            self.after(0, self.start_p2_background)
+        else:
+            self.after(0, lambda: self._set_status(
+                "Phase 1 ended — target not fully profiled. Try again.", ACCENT_RED))
+            self.after(0, lambda: self.start_btn.config(state="normal", bg=ACCENT_GREEN))
+            self.after(0, lambda: self.stop_reid_btn.config(state="disabled"))
+
+    # ------------------------------------------------------------------ #
+    #  PHASE 2 – BACKGROUND SEARCH                                         #
+    # ------------------------------------------------------------------ #
+    def start_p2_background(self):
+        # Reset progress bar explicitly before Phase 2 starts
+        self.prog_bar.config(value=0)
+        self.prog_pct_lbl.config(text="0%", fg=ACCENT_CYAN)
+        
+        self.phase_lbl.config(text="[ PHASE 2: SEARCHING FOOTAGE ]", fg=ACCENT_CYAN)
+        self._set_status("Searching secondary footage...", ACCENT_CYAN)
+        self._set_sidebar_status("searching", "Phase 2: Scanning footage")
+        self.stop_reid_btn.config(state="normal")  # Ensure stop is enabled
+        
+        gallery_array = np.array(self.engine.target_gallery)
+        threading.Thread(
+            target=self.engine.search_video,
+            args=(VIDEO_2, gallery_array, self.update_progress,
+                  self.on_match_found, lambda: not self.is_running, MATCHES_DIR),
+            daemon=True
+        ).start()
+        self.check_match_queue()
+
+    def update_progress(self, value):
+        # Called from background thread — must route ALL Tk updates through after()
+        self.after(0, self._apply_progress, value)
+
+    def _apply_progress(self, value):
+        """Runs on the main Tk thread."""
+        self.prog_bar["value"] = value
+        self.prog_pct_lbl.config(text=f"{value}%",
+                                  fg=ACCENT_CYAN if value < 100 else ACCENT_GREEN)
+        if value >= 100:
+            self.search_complete = True
+            # Give the UI queue 800ms to drain all remaining match callbacks
+            self.after(800, self._on_search_complete)
+
+    def _on_search_complete(self):
+        total = len(self.match_results)
+        self.phase_lbl.config(text="[ SEARCH COMPLETE ]", fg=ACCENT_GREEN)
+        self._set_status(f"Search complete — {total} match(es) found", ACCENT_GREEN)
+        self._set_sidebar_status("done", f"Done — {total} matches")
+        self.status_dot.config(text="● DONE", fg=ACCENT_GREEN)
+        self.match_count_lbl.config(text=str(total))
+        self.live_match_lbl.config(text=str(total))
+        self.results_total_lbl.config(text=str(total))
+        self.start_btn.config(state="normal", bg=ACCENT_GREEN)
+        self.stop_reid_btn.config(state="disabled")
+
+        if total > 0:
+            # Show View Results button on reid page
+            self.reid_results_btn.pack(fill="x", pady=(10, 0))
+            # Show in sidebar
+            self.view_results_btn.pack(fill="x", padx=10, pady=8)
+
+    def on_match_found(self, filepath, video_name, timestamp):
+        # Called from background thread — route to main thread via after()
+        self.after(0, self.match_queue.append, (filepath, video_name, timestamp))
+
+    def check_match_queue(self):
+        # Only process if we're actively searching or waiting for search completion
+        if not self.is_running and not self.search_complete:
+            return
+        
+        while self.match_queue:
+            filepath, video_name, ts = self.match_queue.pop(0)
+            self.match_results.append((filepath, video_name, ts))
+            count = len(self.match_results)
+            self.live_match_lbl.config(text=str(count))
+            self.match_count_lbl.config(text=str(count))
+
+        # Keep polling until search is done AND queue is fully empty
+        if (self.is_running or self.search_complete) and (not self.search_complete or self.match_queue):
+            self.after(150, self.check_match_queue)
+
+    # ------------------------------------------------------------------ #
+    #  RESULTS VIEWER                                                      #
+    # ------------------------------------------------------------------ #
+    def _refresh_results_page(self):
+        total = len(self.match_results)
+        self.results_total_lbl.config(text=str(total))
+        if total == 0:
+            self.result_img_lbl.config(image="", text="[ NO MATCHES FOUND ]")
+            self.nav_pos_lbl.config(text="0 / 0")
+            self.result_counter_lbl.config(text="0 results")
+            for f in self.meta_fields.values():
+                f.config(text="—")
+            self.zoom_lbl.config(text="—")
+            return
+
+        self.current_result_idx = 0
+        self.result_counter_lbl.config(text=f"{total} result(s)")
+        self._show_result(0)
+        # Focus on image for keyboard shortcuts
+        self.result_img_lbl.focus_set()
+
+    def _show_result(self, idx):
+        if not self.match_results:
+            return
+        idx = max(0, min(idx, len(self.match_results) - 1))
+        self.current_result_idx = idx
+
+        filepath, video_name, timestamp = self.match_results[idx]
+
+        # Load image
+        try:
+            img = Image.open(filepath)
+            self.result_original_image = img.copy()  # Store original
+            self.result_zoom_level = 1.0  # Reset zoom
+            self._update_result_display()
+        except Exception as e:
+            self.result_img_lbl.config(image="", text=f"[ Error loading image: {e} ]")
+
+        # Update metadata
+        total = len(self.match_results)
+        self.meta_fields["video"].config(text=video_name)
+        self.meta_fields["timestamp"].config(text=timestamp, fg=ACCENT_CYAN)
+        self.meta_fields["index"].config(text=f"#{idx + 1} of {total}")
+        self.meta_fields["saved"].config(text=os.path.basename(filepath), fg=ACCENT_GREEN)
+        self.nav_pos_lbl.config(text=f"{idx + 1} / {total}")
+
+        # Button states
+        self.prev_btn.config(fg=TEXT_PRIMARY if idx > 0 else TEXT_DIM,
+                              state="normal" if idx > 0 else "disabled")
+        self.next_btn.config(fg=TEXT_PRIMARY if idx < total - 1 else TEXT_DIM,
+                              state="normal" if idx < total - 1 else "disabled")
+
+    def _update_result_display(self):
+        """Render the image with current zoom level."""
+        if self.result_original_image is None:
+            return
+        
+        img = self.result_original_image.copy()
+        
+        # Base display dimensions
+        base_w, base_h = 580, 480
+        
+        # Apply zoom (scale dimensions)
+        zoom_w = int(base_w * self.result_zoom_level)
+        zoom_h = int(base_h * self.result_zoom_level)
+        
+        # Resize image
+        img.thumbnail((zoom_w, zoom_h), Image.LANCZOS)
+        
+        # Add padding to center (always fit to display area)
+        bg = Image.new("RGB", (base_w, base_h), (4, 8, 16))
+        offset_x = (base_w - img.width) // 2
+        offset_y = (base_h - img.height) // 2
+        bg.paste(img, (offset_x, offset_y))
+        
+        img_tk = ImageTk.PhotoImage(bg)
+        self.result_img_lbl.config(image=img_tk, text="")
+        self.result_img_lbl._img = img_tk
+        
+        # Update zoom display
+        zoom_pct = int(self.result_zoom_level * 100)
+        self.zoom_lbl.config(text=f"{zoom_pct}%")
+
+    def zoom_in_result(self):
+        """Increase zoom level."""
+        if self.result_original_image is None:
+            return
+        self.result_zoom_level = min(self.result_zoom_level + 0.2, 3.0)  # Max 300%
+        self._update_result_display()
+
+    def zoom_out_result(self):
+        """Decrease zoom level."""
+        if self.result_original_image is None:
+            return
+        self.result_zoom_level = max(self.result_zoom_level - 0.2, 0.5)  # Min 50%
+        self._update_result_display()
+
+    def reset_zoom(self):
+        """Reset zoom to 100% fit."""
+        if self.result_original_image is None:
+            return
+        self.result_zoom_level = 1.0
+        self._update_result_display()
+
+    def _on_results_mousewheel(self, event):
+        """Handle mouse wheel zoom on results image."""
+        # event.delta > 0 = scroll up = zoom in (Windows)
+        # event.num == 4 = scroll up (Linux)
+        # event.num == 5 = scroll down (Linux)
+        if event.delta > 0 or event.num == 4:
+            self.zoom_in_result()
+        else:
+            self.zoom_out_result()
+
+    def show_prev_result(self):
+        self._show_result(self.current_result_idx - 1)
+        self.result_img_lbl.focus_set()
+
+    def show_next_result(self):
+        self._show_result(self.current_result_idx + 1)
+        self.result_img_lbl.focus_set()
+
+    # ------------------------------------------------------------------ #
+    #  HELPERS                                                             #
+    # ------------------------------------------------------------------ #
+    def select_zone_video(self):
+        """File picker for the Zone Monitoring module."""
+        path = filedialog.askopenfilename(filetypes=[("Video files", "*.mp4 *.avi *.mkv")])
+        if path: 
+            self._set_sidebar_status("active", "Zone Setup: Ready")
+            self.start_zone_thread(path)
+
+    def start_zone_thread(self, source):
+        """Initializes monitoring and launches the background thread."""
+        self.is_running = True
+        self._set_sidebar_status("searching", "Monitoring Zones...")
+        threading.Thread(target=self.run_zone_monitoring, args=(source,), daemon=True).start()
+    
+    def activate_zone_ai(self):
+        """Activates AI monitoring mode after zones have been drawn."""
+        if not self.zone_engine.zones:
+            messagebox.showwarning("Zone Setup", "Please draw at least one zone first!")
+            return
+        self.zone_ai_active = True
+        self.start_ai_btn.config(state="disabled", text="▶ AI MONITORING ACTIVE", fg=ACCENT_AMBER)
+        self._set_sidebar_status("searching", "AI Monitoring Active - Processing...")
+        self._set_status("AI zone monitoring activated. Video playback started.", ACCENT_GREEN)
+    
+    def record_zone_point(self, event):
+        """Handle left-click to add polygon point."""
+        if self.is_running and hasattr(self, 'setup_frame') and self.setup_frame is not None:
+            # Convert screen coords to video coords
+            label_width = self.zone_vid_label.winfo_width()
+            label_height = self.zone_vid_label.winfo_height()
+            video_width = self.setup_frame.shape[1]
+            video_height = self.setup_frame.shape[0]
+            
+            if label_width < 10 or label_height < 10:
+                return
+            
+            # Pixel-to-video coordinate mapping
+            x_ratio = video_width / label_width
+            y_ratio = video_height / label_height
+            video_x = int(event.x * x_ratio)
+            video_y = int(event.y * y_ratio)
+            
+            # Clamp to video bounds
+            video_x = max(0, min(video_x, video_width - 1))
+            video_y = max(0, min(video_y, video_height - 1))
+            
+            self.temp_points.append((video_x, video_y))
+            
+            # Show preview with current points
+            preview = self.zone_engine.draw_preview(self.setup_frame.copy(), self.temp_points)
+            self.after(0, lambda: self._apply_image_to_label(preview, self.zone_vid_label))
+            self._set_status(f"Point added: {len(self.temp_points)} points", ACCENT_CYAN)
+    
+    def finalize_zone(self, event):
+        """Handle right-click to finalize polygon."""
+        if len(self.temp_points) < 3:
+            messagebox.showwarning("Zone Drawing", "Need at least 3 points to create a zone!")
+            self.temp_points = []
+            return
+        
+        # Add zone to engine
+        self.zone_engine.add_zone(self.temp_points)
+        self.temp_points = []
+        
+        # Enable AI button and show confirmation
+        self.start_ai_btn.config(state="normal")
+        self._set_status(f"Zone added! Total zones: {len(self.zone_engine.zones)}", ACCENT_GREEN)
+        
+        # Show preview with new zone
+        if hasattr(self, 'setup_frame') and self.setup_frame is not None:
+            preview = self.zone_engine.draw_preview(self.setup_frame.copy(), [])
+            self.after(0, lambda: self._apply_image_to_label(preview, self.zone_vid_label))
+    
+    def run_zone_monitoring(self, source):
+        """Main zone monitoring loop - freezes on first frame until AI monitoring is activated."""
+        cap = cv2.VideoCapture(source)
+        if not cap.isOpened():
+            self.after(0, lambda: messagebox.showerror("Error", "Cannot open video source!"))
+            self.is_running = False
+            return
+        
+        # Get first frame for drawing reference
+        ret, frame = cap.read()
+        if not ret:
+            cap.release()
+            self.is_running = False
+            return
+        
+        self.setup_frame = frame.copy()
+        self.video_cap = cap  # Store for access from activate_zone_ai
+        self.after(0, lambda: self._apply_image_to_label(frame, self.zone_vid_label))
+        self._set_sidebar_status("active", "Zone Drawing Mode - Ready for Zones")
+        
+        # Get frame rate for proper playback timing
+        fps = cap.get(cv2.CAP_PROP_FPS) or 30
+        frame_delay = 1000 // fps  # Convert to milliseconds
+        last_time = time.time()
+        
+        while self.is_running and cap.isOpened():
+            # If AI monitoring is active, process zone detection
+            if self.zone_ai_active:
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                
+                # Control frame rate
+                elapsed = (time.time() - last_time) * 1000
+                if elapsed < frame_delay:
+                    time.sleep((frame_delay - elapsed) / 1000)
+                last_time = time.time()
+                
+                timestamp_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+                result_frame, alerts = self.zone_engine.process_frame(frame, timestamp_str, ZONE_ALERTS_DIR)
+                
+                # Display results and alerts
+                self.after(0, lambda f=result_frame: self._apply_image_to_label(f, self.zone_vid_label))
+                
+                # Add alerts to the list
+                for alert in alerts:
+                    self.after(0, lambda a=alert: self.alert_box.insert(0, a))
+            else:
+                # Freeze on first frame - wait for user to activate monitoring
+                time.sleep(0.1)
+        
+        cap.release()
+        self.video_cap = None
+        self.is_running = False
+        self.zone_ai_active = False
+        self.start_ai_btn.config(state="normal", text="▶ START AI MONITORING", fg=TEXT_PRIMARY)
+        self.after(0, lambda: self._set_sidebar_status("idle", "Monitoring Complete"))
+
+    # Zone methods above (activate_zone_ai, record_zone_point, finalize_zone, run_zone_monitoring, stop_processing)
+
+    def update_display(self, frame):
+        # Called from Phase 1 thread — schedule on main thread
+        self.after(0, self._apply_display, frame.copy())
+
+    def _apply_display(self, frame):
+        lw = self.vid_label.winfo_width()
+        lh = self.vid_label.winfo_height()
+        if lw < 10 or lh < 10:
+            lw, lh = 800, 450
+        img = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)).resize((lw, lh))
+        img_tk = ImageTk.PhotoImage(img)
+        self.vid_label.config(image=img_tk, text="")
+        self.vid_label._img_tk = img_tk
+
+    def _set_status(self, text, color=TEXT_SECONDARY):
+        self.status_lbl.config(text=text, fg=color)
+
+    def _set_sidebar_status(self, mode, text):
+        colors = {"active": ACCENT_AMBER, "searching": ACCENT_CYAN,
+                  "done": ACCENT_GREEN, "idle": TEXT_DIM}
+        icons  = {"active": "● ACTIVE", "searching": "◌ SCANNING",
+                  "done": "✔ COMPLETE", "idle": "● IDLE"}
+        self.status_dot.config(text=icons.get(mode, "●"), fg=colors.get(mode, TEXT_DIM))
+        self.sidebar_status.config(text=text)
+
+    def stop_processing(self):
+        """Global stop for all active AI video threads."""
+        self.is_running = False
+        self._set_sidebar_status("idle", "System Standby")
+        self._set_status("All operations stopped.", TEXT_SECONDARY)
+        messagebox.showinfo("System Info", "Processing stopped manually.")
+
+    def stop_reid(self):
+        """Stop ReID and perform a deep reset of UI and Engine."""
+        # STEP 1: Stop the thread by setting is_running to False (this triggers stop_check() in search_video)
+        self.is_running = False
+        self.search_complete = False
+        
+        # STEP 2: Reset the AI Engine completely
+        self.engine.full_reset()
+        
+        # STEP 3: Clear all UI state variables
+        self.selected_tid = None
+        self.latest_detections = []
+        self.match_queue = []
+        self.match_results = []
+        self.current_result_idx = 0
+        
+        # STEP 4: Clear the Result Gallery if it exists (thumbnails at bottom)
+        if hasattr(self, 'inner_gal'):
+            for widget in self.inner_gal.winfo_children():
+                widget.destroy()
+        
+        # STEP 5: Reset all UI Labels & Progress
+        self.locked_id_lbl.config(text="—")
+        self.live_match_lbl.config(text="0")
+        self.match_count_lbl.config(text="0")
+        self.prog_bar.config(value=0)
+        self.prog_pct_lbl.config(text="0%", fg=TEXT_DIM)
+        self.phase_lbl.config(text="[ SYSTEM RESET ]", fg=ACCENT_RED)
+        self.vid_label.config(image="", text="[ VIDEO FEED RESET ]", fg=TEXT_DIM)
+        
+        # STEP 6: Update button states
+        self.start_btn.config(state="normal", bg=ACCENT_GREEN)
+        self.stop_reid_btn.config(state="disabled")
+        
+        # STEP 7: Update status messages
+        self._set_status("System fully reset. Ready for Phase 1.", TEXT_SECONDARY)
+        self._set_sidebar_status("idle", "Ready to begin")
+
+    def _build_zone_page(self):
+        p = self.zone_page # Make sure to initialize self.zone_page in __init__
+        hdr = tk.Frame(p, bg=BG_DARK)
+        hdr.pack(fill="x", padx=25, pady=(20, 10))
+        tk.Label(hdr, text="VIRTUAL RESTRICTED ZONES", font=self.font_head, fg=TEXT_PRIMARY, bg=BG_DARK).pack(side="left")
+        
+        main_cols = tk.Frame(p, bg=BG_DARK)
+        main_cols.pack(fill="both", expand=True, padx=25, pady=15)
+
+        # --- RIGHT SIDEBAR (ALERTS) ---
+        right_col = tk.Frame(main_cols, bg=BG_PANEL, width=350)
+        right_col.pack(side="right", fill="y", padx=(15, 0))
+        right_col.pack_propagate(False)
+
+        tk.Label(right_col, text="INTRUSION ALERTS", font=self.font_mono, fg=ACCENT_RED, bg=BG_PANEL).pack(pady=10)
+
+        # Monitoring controls (start/stop source)
+        tk.Label(right_col, text="MONITORING CONTROLS", font=self.font_head, fg=ACCENT_CYAN, bg=BG_PANEL).pack(pady=10)
+        tk.Button(right_col, text="📁 LOAD VIDEO", font=self.font_btn, bg=BG_CARD, fg=TEXT_PRIMARY,
+              command=lambda: self.select_zone_video()).pack(fill="x", padx=20, pady=5)
+        tk.Button(right_col, text="📷 LIVE WEBCAM", font=self.font_btn, bg=BG_CARD, fg=TEXT_PRIMARY,
+              command=lambda: self.start_zone_thread(0)).pack(fill="x", padx=20, pady=5)
+
+        self.start_ai_btn = tk.Button(right_col, text="▶ START AI MONITORING", font=self.font_btn, 
+                                      bg=ACCENT_GREEN, fg=TEXT_PRIMARY, state="disabled", 
+                                      command=self.activate_zone_ai, pady=12)
+        self.start_ai_btn.pack(fill="x", padx=20, pady=10)
+
+        # Scrollable Alert List
+        self.alert_box = tk.Listbox(right_col, bg=BG_DARK, fg=ACCENT_RED, font=self.font_mono, 
+                         borderwidth=0, highlightthickness=1, highlightbackground=BORDER)
+        self.alert_box.pack(fill="both", expand=True, padx=10, pady=5)
+
+        tk.Button(right_col, text="CLEAR ZONES", font=self.font_btn, bg=BG_CARD, fg=TEXT_PRIMARY, 
+                  command=self.zone_engine.clear_zones).pack(fill="x", padx=20, pady=5)
+        
+        self.stop_zone_btn = tk.Button(right_col, text="■ STOP MONITORING", font=self.font_btn, 
+                                       bg=ACCENT_RED, fg=TEXT_PRIMARY, pady=12, command=self.stop_processing)
+        self.stop_zone_btn.pack(fill="x", padx=20, pady=10)
+
+        # --- LEFT AREA (VIDEO) ---
+        left_col = tk.Frame(main_cols, bg=BG_DARK)
+        left_col.pack(side="left", fill="both", expand=True)
+        
+        feed_wrap = tk.Frame(left_col, bg=BG_CARD, highlightthickness=1, highlightbackground=BORDER_BRIGHT)
+        feed_wrap.pack(fill="both", expand=True)
+        
+        self.zone_vid_label = tk.Label(feed_wrap, bg="#040810", text="[ CLICK TO DRAW POLYGON ]", font=self.font_sub, fg=TEXT_DIM)
+        self.zone_vid_label.pack(fill="both", expand=True, padx=4, pady=4)
+        
+        # Drawing Bindings
+        self.zone_vid_label.bind("<Button-1>", self.record_zone_point)
+        self.zone_vid_label.bind("<Button-3>", self.finalize_zone)
+        
+        self.temp_points = []
+        self.zone_ai_active = False  # Toggle between drawing and monitoring modes
+
+
+if __name__ == "__main__":
+    app = SentinelVision()
+    app.mainloop()
