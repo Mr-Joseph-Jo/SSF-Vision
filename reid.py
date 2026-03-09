@@ -6,7 +6,12 @@ import time
 import json
 from ultralytics import YOLO
 import supervision as sv
-from torchreid.utils import FeatureExtractor
+try:
+    # Some torchreid builds expose utils at the top level
+    from torchreid.utils import FeatureExtractor  # type: ignore
+except Exception:
+    # deep-person-reid (KaiyangZhou) exposes it under torchreid.reid.utils
+    from torchreid.reid.utils import FeatureExtractor  # type: ignore
 from collections import defaultdict
 
 # GPU acceleration support - try multiple backends

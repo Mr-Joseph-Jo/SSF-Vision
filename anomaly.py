@@ -21,7 +21,7 @@ VIDEO_PATH = './videos/loitering.avi' # for loitering detection
 #VIDEO_PATH = './videos/test.mp4'      # for fall / fight detection
 
 # --- MODEL & OUTPUT ---
-MODEL_PATH    = 'yolov8x-pose.pt'
+MODEL_PATH    = 'yolov8n-pose.pt'
 SAVE_DIR      = 'evidence_clips'
 FALL_SAVE_DIR = os.path.join(SAVE_DIR, 'fall')
 
@@ -417,6 +417,10 @@ class FallFightDetector(BaseDetector):
     def _start_recording(self, frame_shape, tid, event):
         if self.is_recording:
             return
+        # Only start a clip if we already have at least 1 second of buffered
+        # frames — this eliminates sub-second spam clips from transient detections.
+        if len(self.frame_buffer) < int(self.fps):
+            return
         fh, fw = frame_shape[:2]
         fname  = os.path.join(
             self.save_dir,
@@ -440,9 +444,13 @@ class FallFightDetector(BaseDetector):
         """
         Keypoint-confidence-gated fall check.
         Requires both torso tilt > 45° AND downward hip velocity.
-        Returns False immediately if any critical keypoint has low confidence.
+        Returns False immediately if keypoints lack a confidence column or are too small.
         """
-        # --- Confidence gate (index 2 = confidence in xyn format) ---
+        # Need at least 13 keypoints and a confidence column (dim >= 3)
+        if avg_kpts.shape[0] < 13 or avg_kpts.ndim < 2 or avg_kpts.shape[-1] < 3:
+            return False
+
+        # --- Confidence gate (index 2 = confidence in keypoints_xy format) ---
         critical = [5, 6, 11, 12]   # left/right shoulder, left/right hip
         if any(avg_kpts[j][2] < 0.3 for j in critical):
             return False
@@ -481,13 +489,19 @@ class FallFightDetector(BaseDetector):
 
         fall_fight_data = {}
 
-        if boxes is None or keypoints_xyn is None:
+        # keypoints_xy  → shape [N, 17, 3]  pixel x, y, confidence  ← required here
+        # keypoints_xyn → shape [N, 17, 2]  normalised x, y only (no confidence col)
+        # _check_fall_keypoints reads index [j][2] for confidence, so we must use
+        # keypoints_xy throughout this detector.
+        if boxes is None or keypoints_xy is None:
             return fall_fight_data
 
         for i, box in enumerate(boxes):
             x1,y1,x2,y2 = int(box[0]),int(box[1]),int(box[2]),int(box[3])
             tid          = int(box[4])
-            raw_kpts     = keypoints_xyn[i]
+            if i >= len(keypoints_xy):
+                continue
+            raw_kpts     = keypoints_xy[i]   # shape [17, 3] — x, y, confidence
 
             if tid not in self.pose_history:
                 self.pose_history[tid] = {
@@ -519,7 +533,7 @@ class FallFightDetector(BaseDetector):
             has_fall   = False
 
             if prev_k is not None:
-                # --- Fight detection ---
+                # --- Fight detection (visual alert only — no evidence clip saved) ---
                 lw = float(np.linalg.norm(avg_kpts[9]  - prev_k[9]))  / torso_size
                 rw = float(np.linalg.norm(avg_kpts[10] - prev_k[10])) / torso_size
                 hd = float(np.linalg.norm(avg_kpts[0]  - prev_k[0]))  / torso_size
@@ -527,7 +541,10 @@ class FallFightDetector(BaseDetector):
                         and hd > FIGHT_HEAD_THRESHOLD
                         and all_box_count > 1):
                     has_fight = True
-                    self._log_and_record(tid, "FIGHT", frame.shape)
+                    # Log to CSV only — no clip recording for fight events
+                    if not self._in_cooldown(tid, "FIGHT"):
+                        self._set_cooldown(tid, "FIGHT")
+                        self.logger.log(tid, "FIGHT")
                     active_alerts.append(f"FIGHT ID{tid}")
 
                 # --- Fall detection: keypoint-based + aspect ratio ---
@@ -687,6 +704,24 @@ class LoiteringDetector(BaseDetector):
 
             if is_alert:
                 if tid not in self.active_writers:
+                    # Only open a clip writer if the person has been alerting for
+                    # more than 1 second — avoids clips from transient detections.
+                    if dwell_frames < int(self.fps) + limit_f:
+                        # Still within the first second of the alert — skip for now
+                        active_alerts.append(f"{behavior} ID{tid}")
+                        loiter_data[tid] = {
+                            'in_zone':   True,
+                            'is_alert':  is_alert,
+                            'behavior':  behavior,
+                            'posture':   posture,
+                            'gaze':      gaze,
+                            'speed':     speed,
+                            'dwell_sec': dwell_sec,
+                            'kpts':      kpts,
+                            'path_pts':  path_pts,
+                            'x1':x1,'y1':y1,'x2':x2,'y2':y2
+                        }
+                        continue
                     fn = f"ID{tid}_{behavior}_{frame_count}.avi"
                     self.active_writers[tid] = cv2.VideoWriter(
                         os.path.join(self.save_dir, fn),
@@ -694,6 +729,8 @@ class LoiteringDetector(BaseDetector):
                         self.fps, (self.W, self.H))
                     print(f"[INFO] REC loiter | ID {tid} | "
                           f"{behavior} | frame {frame_count}")
+                # Write every frame while the alert is active (continuous clip)
+                self.active_writers[tid].write(frame)
                 active_alerts.append(f"{behavior} ID{tid}")
 
             loiter_data[tid] = {

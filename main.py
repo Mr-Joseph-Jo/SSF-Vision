@@ -79,6 +79,12 @@ class SentinelVision(tk.Tk):
         self.suspect_video_path = None
         self.suspect_is_running = False
         self.suspect_match_results = []
+
+        # Anomaly Detection state
+        self.anomaly_video_path = None
+        self.anomaly_is_running = False
+        self.anomaly_results = []
+        self.anomaly_log_path = 'security_logs.csv'
         
         # Zoom state for results viewer
         self.result_zoom_level = 1.0  # 1.0 = 100% fit to display
@@ -149,6 +155,7 @@ class SentinelVision(tk.Tk):
         self.zone_page      = tk.Frame(self.content, bg=BG_DARK)
         self.results_page   = tk.Frame(self.content, bg=BG_DARK)
         self.suspect_page   = tk.Frame(self.content, bg=BG_DARK)
+        self.anomaly_page   = tk.Frame(self.content, bg=BG_DARK)
 
         self._build_home_page()
         self._build_reid_page()
@@ -156,6 +163,7 @@ class SentinelVision(tk.Tk):
         self._build_zone_page()
         self._build_results_page()
         self._build_suspect_page()
+        self._build_anomaly_page()
 
     def _build_sidebar(self):
         tk.Frame(self.sidebar, bg=BG_PANEL, height=20).pack()
@@ -165,9 +173,10 @@ class SentinelVision(tk.Tk):
             ("Home",      "⌂", "Dashboard"),
             ("ReID",      "◉", "Person Re-ID"),
             ("Analytics", "📊", "People Analytics"),
-            ("Zones",     "🚫", "Restricted Zones"), # Add this
+            ("Zones",     "🚫", "Restricted Zones"),
             ("Results",   "▦", "Match Results"),
             ("Suspect",   "🔍", "Suspect Finder"),
+            ("Anomaly",   "⚠", "Anomaly Detection"),
         ]
         self.nav_btns = {}
         for key, icon, label in nav_items:
@@ -544,6 +553,7 @@ class SentinelVision(tk.Tk):
             ("zones",    "🚫  ZONE ALERTS",      ACCENT_RED),
             ("heatmaps", "📊  HEATMAP REPORTS",  ACCENT_AMBER),
             ("suspect",  "🔍  SUSPECT FINDER",   ACCENT_BLUE),
+            ("anomaly",  "⚠  ANOMALY ALERTS",   ACCENT_AMBER),
         ]
         for key, label, color in tab_defs:
             btn = tk.Button(tab_bar, text=label,
@@ -680,6 +690,7 @@ class SentinelVision(tk.Tk):
             ("zones",    "🚫 ZONE ALERTS",     ACCENT_RED),
             ("heatmaps", "📊 HEATMAP REPORTS", ACCENT_AMBER),
             ("suspect",  "🔍 SUSPECT FINDER",  ACCENT_BLUE),
+            ("anomaly",  "⚠ ANOMALY ALERTS",  ACCENT_AMBER),
         ]
         for key, label, color in tab_count_defs:
             row = tk.Frame(ts_inner, bg=BG_CARD)
@@ -756,7 +767,7 @@ class SentinelVision(tk.Tk):
     def _switch_results_tab(self, tab_key):
         """Switch active results tab and reload items."""
         self._active_results_tab = tab_key
-        tab_colors = {"reid": ACCENT_CYAN, "zones": ACCENT_RED, "heatmaps": ACCENT_AMBER, "suspect": ACCENT_BLUE}
+        tab_colors = {"reid": ACCENT_CYAN, "zones": ACCENT_RED, "heatmaps": ACCENT_AMBER, "suspect": ACCENT_BLUE, "anomaly": ACCENT_AMBER}
 
         for k, btn in self._tab_btns.items():
             active = (k == tab_key)
@@ -782,6 +793,10 @@ class SentinelVision(tk.Tk):
             items = self._scan_suspect_results()
             type_label = "Suspect Finder Match"
             dir_label = f"./{SUSPECT_FINDER_DIR}/"
+        elif tab_key == "anomaly":
+            items = self._scan_anomaly_results()
+            type_label = "Anomaly Detection Alert"
+            dir_label = "./evidence_clips/"
         else:  # heatmaps
             items = self._scan_heatmap_results()
             type_label = "Heatmap / Analytics Report"
@@ -875,13 +890,768 @@ class SentinelVision(tk.Tk):
                 ts = datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M:%S")
                 items.append((fpath, directory, ts))
         return items
-        
+
+    def _scan_anomaly_results(self):
+        """Scan evidence_clips for anomaly images and video clips (first frame)."""
+        items = []
+        evidence_dir = "evidence_clips"
+        if not os.path.isdir(evidence_dir):
+            return items
+        thumb_dir = os.path.join(evidence_dir, ".thumbs")
+        os.makedirs(thumb_dir, exist_ok=True)
+        for root, dirs, files in os.walk(evidence_dir):
+            # Skip the thumbs directory itself
+            if ".thumbs" in root:
+                continue
+            for fname in sorted(files):
+                fpath = os.path.join(root, fname)
+                mtime = os.path.getmtime(fpath)
+                ts = datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M:%S")
+                event_type = os.path.basename(root).upper() if os.path.basename(root) != "evidence_clips" else "ANOMALY"
+                label = f"{event_type} — {fname}"
+                if fname.lower().endswith((".jpg", ".jpeg", ".png")):
+                    items.append((fpath, label, ts))
+                elif fname.lower().endswith((".avi", ".mp4", ".mkv")):
+                    # Extract first frame as thumbnail
+                    thumb_path = os.path.join(thumb_dir, fname + ".jpg")
+                    if not os.path.isfile(thumb_path):
+                        try:
+                            cap_t = cv2.VideoCapture(fpath)
+                            ret_t, frame_t = cap_t.read()
+                            if ret_t:
+                                # Add a label overlay
+                                cv2.putText(frame_t, f"▶ {event_type}", (10, 30),
+                                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 200, 255), 2)
+                                cv2.imwrite(thumb_path, frame_t)
+                            cap_t.release()
+                        except Exception:
+                            pass
+                    if os.path.isfile(thumb_path):
+                        items.append((thumb_path, label, ts))
+        return items
+
+    # ------------------------------------------------------------------ #
+    #  ANOMALY DETECTION PAGE                                             #
+    # ------------------------------------------------------------------ #
+    # ================================================================== #
+    #  ANOMALY DETECTION PAGE                                           #
+    # ================================================================== #
+    def _build_anomaly_page(self):
+        p = self.anomaly_page
+
+        # ── Page header ────────────────────────────────────────────────
+        hdr = tk.Frame(p, bg=BG_DARK)
+        hdr.pack(fill="x", padx=25, pady=(20, 10))
+        tk.Label(hdr, text="ANOMALY DETECTION",
+                 font=("Courier New", 16, "bold"), fg=TEXT_PRIMARY, bg=BG_DARK).pack(side="left")
+        self.anomaly_phase_lbl = tk.Label(hdr, text="[ IDLE ]",
+                                           font=("Courier New", 10, "bold"),
+                                           fg=ACCENT_AMBER, bg=BG_DARK)
+        self.anomaly_phase_lbl.pack(side="right")
+        tk.Frame(p, bg=BORDER, height=1).pack(fill="x", padx=25)
+
+        # ── Instruction banner (shown during zone-draw mode) ───────────
+        self.anomaly_instruction_bar = tk.Frame(p, bg="#1a1000", height=34)
+        self.anomaly_instruction_lbl = tk.Label(
+            self.anomaly_instruction_bar,
+            text="✦  ZONE DRAW MODE  —  Click to add points  |  ENTER = confirm zone  |  C = clear  |  ESC = full-frame",
+            font=("Courier New", 9, "bold"), fg=ACCENT_AMBER, bg="#1a1000")
+        self.anomaly_instruction_lbl.pack(side="left", padx=15, pady=8)
+        # Don't pack yet — shown only in draw mode
+
+        # ── Main column layout ─────────────────────────────────────────
+        cols = tk.Frame(p, bg=BG_DARK)
+        cols.pack(fill="both", expand=True, padx=25, pady=(10, 15))
+
+        # ── RIGHT SIDEBAR ──────────────────────────────────────────────
+        right_col = tk.Frame(cols, bg=BG_DARK, width=285)
+        right_col.pack(side="right", fill="y", padx=(15, 0))
+        right_col.pack_propagate(False)
+
+        # Data Source
+        src_card = tk.Frame(right_col, bg=BG_CARD, highlightthickness=1, highlightbackground=BORDER)
+        src_card.pack(fill="x", pady=(0, 8))
+        tk.Label(src_card, text="DATA SOURCE", font=("Courier New", 9, "bold"),
+                 fg=TEXT_SECONDARY, bg=BG_SURFACE).pack(fill="x", padx=10, pady=6)
+        src_inner = tk.Frame(src_card, bg=BG_CARD)
+        src_inner.pack(fill="x", padx=8, pady=8)
+
+        self.anomaly_source_lbl = tk.Label(src_inner, text="No source loaded",
+                                            font=("Courier New", 8), fg=TEXT_DIM,
+                                            bg=BG_CARD, wraplength=230, justify="left")
+        self.anomaly_source_lbl.pack(anchor="w", pady=(0, 8))
+
+        tk.Button(src_inner, text="📁  LOAD VIDEO FILE", font=self.font_btn,
+                  bg=BG_SURFACE, fg=TEXT_PRIMARY, relief="flat", pady=8, cursor="hand2",
+                  highlightbackground=BORDER, highlightthickness=1,
+                  command=self._anomaly_load_video).pack(fill="x", pady=(0, 5))
+        tk.Button(src_inner, text="📷  USE WEBCAM", font=self.font_btn,
+                  bg=BG_SURFACE, fg=TEXT_PRIMARY, relief="flat", pady=8, cursor="hand2",
+                  highlightbackground=BORDER, highlightthickness=1,
+                  command=self._anomaly_use_webcam).pack(fill="x")
+
+        # Zone Setup
+        zone_card = tk.Frame(right_col, bg=BG_CARD, highlightthickness=1, highlightbackground=BORDER)
+        zone_card.pack(fill="x", pady=(0, 8))
+        tk.Label(zone_card, text="MONITORING ZONE", font=("Courier New", 9, "bold"),
+                 fg=TEXT_SECONDARY, bg=BG_SURFACE).pack(fill="x", padx=10, pady=6)
+        zone_inner = tk.Frame(zone_card, bg=BG_CARD)
+        zone_inner.pack(fill="x", padx=8, pady=8)
+
+        self.anomaly_zone_status = tk.Label(zone_inner,
+                                             text="● Full frame (default)",
+                                             font=("Courier New", 8, "bold"),
+                                             fg=ACCENT_GREEN, bg=BG_CARD)
+        self.anomaly_zone_status.pack(anchor="w", pady=(0, 8))
+
+        zone_btn_row = tk.Frame(zone_inner, bg=BG_CARD)
+        zone_btn_row.pack(fill="x")
+        self.anomaly_draw_zone_btn = tk.Button(
+            zone_btn_row, text="✏  DRAW ZONE", font=self.font_btn,
+            bg=ACCENT_CYAN, fg=BG_DARK, relief="flat", pady=7, cursor="hand2",
+            command=self._anomaly_enter_draw_mode)
+        self.anomaly_draw_zone_btn.pack(side="left", fill="x", expand=True, padx=(0, 4))
+
+        tk.Button(zone_btn_row, text="✕  CLEAR", font=self.font_btn,
+                  bg=BG_SURFACE, fg=ACCENT_RED, relief="flat", pady=7, cursor="hand2",
+                  highlightbackground=BORDER, highlightthickness=1,
+                  command=self._anomaly_clear_zone).pack(side="left")
+
+        # Detection Counts
+        cnt_card = tk.Frame(right_col, bg=BG_CARD, highlightthickness=1, highlightbackground=BORDER)
+        cnt_card.pack(fill="x", pady=(0, 8))
+        tk.Label(cnt_card, text="DETECTION COUNTS", font=("Courier New", 9, "bold"),
+                 fg=TEXT_SECONDARY, bg=BG_SURFACE).pack(fill="x", padx=10, pady=6)
+        cnt_inner = tk.Frame(cnt_card, bg=BG_CARD)
+        cnt_inner.pack(fill="x", padx=10, pady=8)
+
+        self.anomaly_counters = {}
+        event_styles = [
+            ("FALL",      ACCENT_RED,   "🔴"),
+
+            ("CROWD",     ACCENT_AMBER, "🟡"),
+            ("LOITERING", ACCENT_CYAN,  "🔵"),
+            ("RUNNING",   ACCENT_AMBER, "🟠"),
+        ]
+        for event, color, icon in event_styles:
+            row = tk.Frame(cnt_inner, bg=BG_CARD)
+            row.pack(fill="x", pady=2)
+            tk.Label(row, text=f"{icon} {event}", font=("Courier New", 9, "bold"),
+                     fg=color, bg=BG_CARD).pack(side="left")
+            cnt_lbl = tk.Label(row, text="0", font=("Courier New", 12, "bold"),
+                               fg=TEXT_PRIMARY, bg=BG_CARD)
+            cnt_lbl.pack(side="right")
+            self.anomaly_counters[event] = cnt_lbl
+
+        # Progress
+        prog_card = tk.Frame(right_col, bg=BG_CARD, highlightthickness=1, highlightbackground=BORDER)
+        prog_card.pack(fill="x", pady=(0, 8))
+        tk.Label(prog_card, text="PROGRESS", font=("Courier New", 9, "bold"),
+                 fg=TEXT_SECONDARY, bg=BG_SURFACE).pack(fill="x", padx=10, pady=6)
+        prog_inner = tk.Frame(prog_card, bg=BG_CARD)
+        prog_inner.pack(fill="x", padx=10, pady=8)
+        self.anomaly_prog = ttk.Progressbar(prog_inner, orient="horizontal", mode="determinate")
+        self.anomaly_prog.pack(fill="x")
+        self.anomaly_prog_lbl = tk.Label(prog_inner, text="0%",
+                                          font=("Courier New", 9), fg=TEXT_DIM, bg=BG_CARD)
+        self.anomaly_prog_lbl.pack(anchor="e", pady=(2, 0))
+
+        # Start / Stop  — must be packed BEFORE the expand=True log frame
+        btn_row = tk.Frame(right_col, bg=BG_DARK)
+        btn_row.pack(fill="x", pady=(0, 4))
+
+        self.anomaly_start_btn = tk.Button(
+            btn_row, text="▶  START DETECTION", font=self.font_btn,
+            bg=ACCENT_GREEN, fg=BG_DARK, relief="flat", pady=11,
+            cursor="hand2", command=self._anomaly_start)
+        self.anomaly_start_btn.pack(side="left", fill="x", expand=True)
+
+        self.anomaly_stop_btn = tk.Button(
+            btn_row, text="■  STOP", font=self.font_btn,
+            bg=ACCENT_RED, fg=TEXT_PRIMARY, relief="flat", pady=11,
+            state="disabled", cursor="hand2", command=self._anomaly_stop)
+        self.anomaly_stop_btn.pack(side="right", padx=(6, 0), fill="x", expand=True)
+
+        # View Results
+        tk.Button(right_col, text="▦  VIEW ANOMALY RESULTS",
+                  font=self.font_btn, bg=ACCENT_AMBER, fg=BG_DARK, pady=8,
+                  relief="flat", cursor="hand2",
+                  command=lambda: (self.show_page("Results"),
+                                   self._switch_results_tab("anomaly"))).pack(fill="x", pady=(0, 6))
+
+        # Security Log  — expand=True must come LAST so buttons above stay visible
+        tk.Label(right_col, text="SECURITY LOG", font=("Courier New", 9, "bold"),
+                 fg=TEXT_SECONDARY, bg=BG_DARK).pack(anchor="w", pady=(4, 2))
+        log_frame = tk.Frame(right_col, bg=BG_CARD, highlightthickness=1,
+                             highlightbackground=BORDER)
+        log_frame.pack(fill="both", expand=True, pady=(0, 0))
+        log_scroll = tk.Scrollbar(log_frame, orient="vertical",
+                                   bg=BG_CARD, troughcolor=BG_PANEL)
+        log_scroll.pack(side="right", fill="y")
+        self.anomaly_log_listbox = tk.Listbox(
+            log_frame, bg="#08090f", fg=TEXT_PRIMARY,
+            font=("Courier New", 7), selectbackground=BG_SURFACE,
+            highlightthickness=0, relief="flat",
+            yscrollcommand=log_scroll.set, activestyle="none")
+        self.anomaly_log_listbox.pack(fill="both", expand=True, padx=2)
+        log_scroll.config(command=self.anomaly_log_listbox.yview)
+
+        # ── LEFT AREA — Video canvas with zone overlay ─────────────────
+        left_col = tk.Frame(cols, bg=BG_DARK)
+        left_col.pack(side="left", fill="both", expand=True)
+
+        feed_wrap = tk.Frame(left_col, bg=BG_CARD,
+                             highlightthickness=1, highlightbackground=BORDER_BRIGHT)
+        feed_wrap.pack(fill="both", expand=True)
+
+        # Use a Canvas so we can draw the zone polygon overlay on top
+        self.anomaly_canvas = tk.Canvas(feed_wrap, bg="#040810",
+                                         highlightthickness=0, cursor="crosshair")
+        self.anomaly_canvas.pack(fill="both", expand=True, padx=4, pady=4)
+
+        # Placeholder text on canvas
+        self._anomaly_canvas_placeholder()
+
+        # Canvas mouse bindings (active only in draw mode)
+        self.anomaly_canvas.bind("<Button-1>",   self._anomaly_canvas_click)
+        self.anomaly_canvas.bind("<Motion>",      self._anomaly_canvas_motion)
+        self.anomaly_canvas.bind("<Key-Return>",  self._anomaly_canvas_confirm)
+        self.anomaly_canvas.bind("<Return>",      self._anomaly_canvas_confirm)
+        self.anomaly_canvas.bind("<Escape>",      self._anomaly_canvas_escape)
+        self.anomaly_canvas.bind("<c>",           self._anomaly_canvas_clear_pts)
+        self.anomaly_canvas.bind("<C>",           self._anomaly_canvas_clear_pts)
+        self.anomaly_canvas.focus_set()
+        # Also bind Return at the page level so it works even without canvas focus
+        p.bind("<Return>", self._anomaly_canvas_confirm)
+        p.bind("<Escape>", self._anomaly_canvas_escape)
+
+        # Status bar below canvas
+        status_bar = tk.Frame(left_col, bg=BG_DARK)
+        status_bar.pack(fill="x", pady=(6, 0))
+
+        self.anomaly_frame_lbl = tk.Label(status_bar, text="",
+                                           font=("Courier New", 8), fg=TEXT_DIM, bg=BG_DARK)
+        self.anomaly_frame_lbl.pack(side="left")
+
+        self.anomaly_pts_lbl = tk.Label(status_bar, text="",
+                                         font=("Courier New", 8, "bold"),
+                                         fg=ACCENT_CYAN, bg=BG_DARK)
+        self.anomaly_pts_lbl.pack(side="right")
+
+        # ── Internal zone-draw state ────────────────────────────────────
+        self.anomaly_draw_mode   = False      # True while user is drawing
+        self.anomaly_zone_points = []         # canvas pixel coords [(x,y)...]
+        self.anomaly_roi_polygon = None       # numpy array in video coords (set on confirm)
+        self._anomaly_img_tk     = None       # keep PhotoImage reference
+        self._anomaly_first_frame = None      # raw BGR frame for zone setup preview
+        self._anomaly_mouse_pos  = (0, 0)    # live cursor position in draw mode
+
+    # ── Canvas helpers ──────────────────────────────────────────────────
+    def _anomaly_canvas_placeholder(self):
+        self.anomaly_canvas.delete("all")
+        cw = self.anomaly_canvas.winfo_width()  or 800
+        ch = self.anomaly_canvas.winfo_height() or 450
+        self.anomaly_canvas.create_text(
+            cw // 2, ch // 2,
+            text="[ SELECT INPUT SOURCE ]\n\nLoad a video or start webcam,\nthen draw your monitoring zone.",
+            font=("Courier New", 13), fill="#3d4f6b",
+            justify="center", tags="placeholder")
+
+    def _anomaly_canvas_render_frame(self, bgr_frame):
+        """Render a BGR frame onto the canvas, return scale factors."""
+        cw = self.anomaly_canvas.winfo_width()  or 800
+        ch = self.anomaly_canvas.winfo_height() or 450
+        img = Image.fromarray(cv2.cvtColor(bgr_frame, cv2.COLOR_BGR2RGB))
+        img = img.resize((cw, ch), Image.LANCZOS)
+        img_tk = ImageTk.PhotoImage(img)
+        self.anomaly_canvas.delete("all")
+        self.anomaly_canvas.create_image(0, 0, anchor="nw", image=img_tk, tags="frame")
+        self._anomaly_img_tk = img_tk
+        fh, fw = bgr_frame.shape[:2]
+        return cw / fw, ch / fh   # scale_x, scale_y
+
+    def _anomaly_redraw_zone(self):
+        """Redraw the zone polygon/points overlay on the canvas."""
+        self.anomaly_canvas.delete("zone")
+        pts = self.anomaly_zone_points
+        if not pts:
+            return
+        mx, my = self._anomaly_mouse_pos
+        # Draw filled translucent polygon if >= 3 pts
+        if len(pts) >= 3:
+            flat = [c for p in pts for c in p]
+            self.anomaly_canvas.create_polygon(
+                flat, fill="#00e5ff", stipple="gray25",
+                outline="#00e5ff", width=2, tags="zone")
+        # Draw edge lines (including preview line to cursor)
+        for i in range(len(pts) - 1):
+            self.anomaly_canvas.create_line(
+                pts[i][0], pts[i][1], pts[i+1][0], pts[i+1][1],
+                fill="#00e5ff", width=2, tags="zone")
+        if self.anomaly_draw_mode and len(pts) >= 1:
+            self.anomaly_canvas.create_line(
+                pts[-1][0], pts[-1][1], mx, my,
+                fill="#00e5ff", width=1, dash=(4, 4), tags="zone")
+            if len(pts) >= 2:
+                self.anomaly_canvas.create_line(
+                    pts[0][0], pts[0][1], mx, my,
+                    fill="#00e5ff", width=1, dash=(4, 4), tags="zone")
+        # Draw vertex dots
+        for i, (px, py) in enumerate(pts):
+            r = 6 if i == 0 else 4
+            col = ACCENT_GREEN if i == 0 else ACCENT_CYAN
+            self.anomaly_canvas.create_oval(
+                px-r, py-r, px+r, py+r,
+                fill=col, outline="white", width=1, tags="zone")
+            self.anomaly_canvas.create_text(
+                px+10, py-10,
+                text=str(i+1), fill="white",
+                font=("Courier New", 7, "bold"), tags="zone")
+
+        # Point count label
+        self.anomaly_pts_lbl.config(
+            text=f"Points: {len(pts)}  |  ENTER to confirm  |  C to clear")
+
+    # ── Canvas event handlers ───────────────────────────────────────────
+    def _anomaly_canvas_click(self, event):
+        if not self.anomaly_draw_mode:
+            return
+        self.anomaly_canvas.focus_set()
+        self.anomaly_zone_points.append((event.x, event.y))
+        self._anomaly_redraw_zone()
+
+    def _anomaly_canvas_motion(self, event):
+        if not self.anomaly_draw_mode:
+            return
+        self._anomaly_mouse_pos = (event.x, event.y)
+        self._anomaly_redraw_zone()
+
+    def _anomaly_canvas_confirm(self, event=None):
+        """Confirm drawn zone and exit draw mode."""
+        if not self.anomaly_draw_mode:
+            return
+        pts = self.anomaly_zone_points
+        if len(pts) < 3:
+            self.anomaly_zone_status.config(
+                text="⚠ Need at least 3 points", fg=ACCENT_RED)
+            return
+        self._anomaly_commit_zone(pts)
+
+    def _anomaly_canvas_escape(self, event=None):
+        """ESC: use full-frame zone."""
+        if not self.anomaly_draw_mode:
+            return
+        self.anomaly_zone_points = []
+        self.anomaly_roi_polygon = None
+        self._anomaly_exit_draw_mode()
+        self.anomaly_zone_status.config(
+            text="● Full frame (default)", fg=ACCENT_GREEN)
+        self.anomaly_pts_lbl.config(text="")
+
+    def _anomaly_canvas_clear_pts(self, event=None):
+        if not self.anomaly_draw_mode:
+            return
+        self.anomaly_zone_points = []
+        self._anomaly_redraw_zone()
+
+    def _anomaly_commit_zone(self, canvas_pts):
+        """Convert canvas pixel coords → video frame coords and store as ROI."""
+        import numpy as np
+        frame = self._anomaly_first_frame
+        if frame is None:
+            self.anomaly_roi_polygon = None
+            self._anomaly_exit_draw_mode()
+            return
+        cw = self.anomaly_canvas.winfo_width()  or 800
+        ch = self.anomaly_canvas.winfo_height() or 450
+        fh, fw = frame.shape[:2]
+        sx, sy = fw / cw, fh / ch
+        vid_pts = [(int(x * sx), int(y * sy)) for x, y in canvas_pts]
+        self.anomaly_roi_polygon = np.array(vid_pts, dtype=np.int32)
+        n = len(canvas_pts)
+        self.anomaly_zone_status.config(
+            text=f"● Custom zone  ({n} points)", fg=ACCENT_CYAN)
+        self._anomaly_exit_draw_mode()
+        self.anomaly_pts_lbl.config(text=f"Zone set: {n} pts — ready")
+        # Redraw final polygon (non-interactive)
+        self._anomaly_redraw_zone()
+
+    def _anomaly_enter_draw_mode(self):
+        """Enter interactive zone-draw mode."""
+        if self._anomaly_first_frame is None:
+            messagebox.showwarning(
+                "No Frame",
+                "Load a video or start webcam first so a preview frame is available.")
+            return
+        if self.anomaly_is_running:
+            messagebox.showinfo("Running", "Stop detection before redrawing the zone.")
+            return
+        self.anomaly_draw_mode   = True
+        self.anomaly_zone_points = []
+        self.anomaly_roi_polygon = None
+        self._anomaly_mouse_pos  = (0, 0)
+        # Show the first frame as background
+        self._anomaly_canvas_render_frame(self._anomaly_first_frame)
+        self._anomaly_redraw_zone()
+        # Show instruction bar (pack after the header divider line at top)
+        self.anomaly_instruction_bar.pack(fill="x", padx=25, pady=(0, 4))
+        self.anomaly_zone_status.config(
+            text="● Drawing…  click to add points", fg=ACCENT_AMBER)
+        self.anomaly_pts_lbl.config(text="Points: 0  |  ENTER to confirm  |  C to clear")
+        self.anomaly_canvas.focus_set()
+        self.anomaly_draw_zone_btn.config(text="✔  CONFIRM ZONE",
+                                           bg=ACCENT_GREEN, fg=BG_DARK,
+                                           command=self._anomaly_canvas_confirm)
+        self.anomaly_canvas.focus_set()
+
+    def _anomaly_exit_draw_mode(self):
+        self.anomaly_draw_mode = False
+        try:
+            self.anomaly_instruction_bar.pack_forget()
+        except Exception:
+            pass
+        self.anomaly_draw_zone_btn.config(text="✏  DRAW ZONE",
+                                           bg=ACCENT_CYAN, fg=BG_DARK,
+                                           command=self._anomaly_enter_draw_mode)
+
+    # ── Source loaders ──────────────────────────────────────────────────
+    def _anomaly_load_video(self):
+        path = filedialog.askopenfilename(
+            filetypes=[("Video files", "*.mp4 *.avi *.mkv *.mov")])
+        if not path:
+            return
+        self.anomaly_video_path = path
+        name = os.path.basename(path)
+        self.anomaly_source_lbl.config(text=name, fg=ACCENT_CYAN)
+        self.anomaly_phase_lbl.config(
+            text=f"[ LOADED: {name} ]", fg=ACCENT_CYAN)
+        # Extract first frame for zone preview
+        cap_p = cv2.VideoCapture(path)
+        ret_p, frame_p = cap_p.read()
+        cap_p.release()
+        if ret_p:
+            self._anomaly_first_frame = cv2.resize(frame_p, (1280, 720))
+            self.after(50, self._anomaly_show_preview)
+        self.anomaly_zone_status.config(
+            text="● Full frame (default)", fg=ACCENT_GREEN)
+        self.anomaly_roi_polygon = None
+        self.anomaly_zone_points = []
+        self.anomaly_pts_lbl.config(text="Draw a zone or keep full-frame default")
+
+    def _anomaly_use_webcam(self):
+        self.anomaly_video_path = 0
+        self.anomaly_source_lbl.config(text="Webcam (device 0)", fg=ACCENT_CYAN)
+        self.anomaly_phase_lbl.config(text="[ WEBCAM READY ]", fg=ACCENT_CYAN)
+        cap_w = cv2.VideoCapture(0)
+        ret_w, frame_w = cap_w.read()
+        cap_w.release()
+        if ret_w:
+            self._anomaly_first_frame = cv2.resize(frame_w, (1280, 720))
+            self.after(50, self._anomaly_show_preview)
+        self.anomaly_zone_status.config(text="● Full frame (default)", fg=ACCENT_GREEN)
+        self.anomaly_roi_polygon = None
+        self.anomaly_zone_points = []
+        self.anomaly_pts_lbl.config(text="Draw a zone or keep full-frame default")
+
+    def _anomaly_show_preview(self):
+        """Show the first frame on the canvas as a static preview."""
+        if self._anomaly_first_frame is None:
+            return
+        self._anomaly_canvas_render_frame(self._anomaly_first_frame)
+        # Re-draw any existing zone
+        self._anomaly_redraw_zone()
+
+    def _anomaly_clear_zone(self):
+        self.anomaly_zone_points = []
+        self.anomaly_roi_polygon = None
+        self.anomaly_draw_mode   = False
+        self._anomaly_exit_draw_mode()
+        self.anomaly_zone_status.config(text="● Full frame (default)", fg=ACCENT_GREEN)
+        self.anomaly_pts_lbl.config(text="")
+        if self._anomaly_first_frame is not None:
+            self._anomaly_show_preview()
+
+    # ── Detection controls ──────────────────────────────────────────────
+    def _anomaly_start(self):
+        if self.anomaly_is_running:
+            return
+        if self.anomaly_video_path is None:
+            messagebox.showwarning(
+                "No Source", "Load a video file or select webcam first.")
+            return
+        # Exit draw mode if still active
+        if self.anomaly_draw_mode:
+            self._anomaly_canvas_escape()
+
+        self.anomaly_is_running = True
+        self.anomaly_results    = []
+        for lbl in self.anomaly_counters.values():
+            lbl.config(text="0")
+        self.anomaly_prog["value"] = 0
+        self.anomaly_prog_lbl.config(text="0%", fg=TEXT_DIM)
+        self.anomaly_start_btn.config(state="disabled", bg=TEXT_DIM)
+        self.anomaly_stop_btn.config(state="normal")
+        self.anomaly_phase_lbl.config(text="[ INITIALISING… ]", fg=ACCENT_AMBER)
+        self._set_sidebar_status("searching", "Anomaly detection active")
+        threading.Thread(target=self._anomaly_loop,
+                         args=(self.anomaly_video_path,), daemon=True).start()
+
+    def _anomaly_stop(self):
+        self.anomaly_is_running = False
+        self.anomaly_start_btn.config(state="normal", bg=ACCENT_GREEN)
+        self.anomaly_stop_btn.config(state="disabled")
+        self.anomaly_phase_lbl.config(text="[ STOPPED ]", fg=ACCENT_RED)
+        self._set_sidebar_status("idle", "Anomaly detection stopped")
+
+    # ── Detection loop (background thread) ─────────────────────────────
+    def _anomaly_loop(self, source):
+        try:
+            import anomaly as _am
+            from anomaly import (select_device, CONF_THRESHOLD, SAVE_DIR,
+                                  FALL_SAVE_DIR, PanicCrowdDetector,
+                                  FallDetector, LoiteringDetector,
+                                  CSVLogger, UI)
+            from ultralytics import YOLO
+            import numpy as np
+        except ImportError as e:
+            self.after(0, lambda err=str(e): messagebox.showerror(
+                "Import Error", f"Cannot load anomaly module:\n{err}"))
+            self.after(0, self._anomaly_stop)
+            return
+
+        try:
+            device   = select_device()
+            model    = YOLO(_am.MODEL_PATH)
+            use_half = (device == "cuda")
+            logger   = CSVLogger(self.anomaly_log_path)
+
+            cap = cv2.VideoCapture(source)
+            if not cap.isOpened():
+                self.after(0, lambda: messagebox.showerror(
+                    "Error", "Cannot open video source."))
+                self.after(0, self._anomaly_stop)
+                return
+
+            src_fps      = cap.get(cv2.CAP_PROP_FPS) or 30
+            fps          = max(src_fps, 1.0)
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 1
+            W, H         = 1280, 720
+
+            # Use custom ROI or full-frame default
+            if self.anomaly_roi_polygon is not None:
+                roi = self.anomaly_roi_polygon
+            else:
+                roi = np.array([[0,0],[W,0],[W,H],[0,H]], np.int32)
+
+            os.makedirs(SAVE_DIR,      exist_ok=True)
+            os.makedirs(FALL_SAVE_DIR, exist_ok=True)
+
+            panic_det  = PanicCrowdDetector(fps, logger, roi, SAVE_DIR, W, H)
+            fall_det   = FallDetector(fps, logger, FALL_SAVE_DIR)
+            loiter_det = LoiteringDetector(fps, logger, roi, SAVE_DIR, W, H)
+
+            event_counts  = {k: 0 for k in self.anomaly_counters}
+            _alert_active = {}   # tid -> set of currently-active alert types
+            frame_count   = 0
+
+            self.after(0, lambda: self.anomaly_phase_lbl.config(
+                text="[ SCANNING… ]", fg=ACCENT_AMBER))
+
+            while cap.isOpened() and self.anomaly_is_running:
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                frame_count += 1
+                frame = cv2.resize(frame, (W, H))
+
+                # Draw ROI boundary on frame
+                pts = roi.reshape(-1, 2)
+                n   = len(pts)
+                for k in range(n):
+                    p1 = tuple(pts[k])
+                    p2 = tuple(pts[(k+1) % n])
+                    cv2.line(frame, p1, p2, (0, 229, 255), 1, cv2.LINE_AA)
+
+                active_alerts = []
+                results = model.track(
+                    frame, persist=True, conf=CONF_THRESHOLD,
+                    verbose=False, device=device, half=use_half, iou=0.5)
+
+                boxes = keypoints_xy = keypoints_xyn = None
+                current_ids = []
+                if (results[0].boxes is not None and
+                        results[0].boxes.id is not None):
+                    boxes         = results[0].boxes.data.cpu().numpy()
+                    keypoints_xy  = results[0].keypoints.data.cpu().numpy()
+                    keypoints_xyn = results[0].keypoints.xyn.cpu().numpy()
+                    current_ids   = [int(b[4]) for b in boxes]
+
+                panic_state, crowd_members = panic_det.compute(
+                    frame, boxes, keypoints_xy, keypoints_xyn,
+                    frame_count, active_alerts=active_alerts)
+                fall_fight_data = fall_det.compute(
+                    frame, boxes, keypoints_xy, keypoints_xyn,
+                    frame_count, active_alerts=active_alerts,
+                    all_box_count=len(current_ids))
+                loiter_data = loiter_det.compute(
+                    frame, boxes, keypoints_xy,
+                    frame_count, active_alerts=active_alerts)
+
+                for mod in (panic_det, fall_det, loiter_det):
+                    mod.cleanup_stale(current_ids, frame_count)
+
+                # Count and draw
+                if boxes is not None:
+                    for i, box in enumerate(boxes):
+                        tid = int(box[4])
+                        x1,y1,x2,y2 = map(int, box[:4])
+                        p_s  = panic_state.get(tid, {})
+                        ff_s = fall_fight_data.get(tid, {})
+                        lo_s = loiter_data.get(tid, {})
+
+                        has_fall  = ff_s.get("has_fall",     False)
+                        in_crowd  = p_s.get("is_in_crowd",  False)
+                        loiter    = lo_s.get("is_alert",     False)
+                        running   = p_s.get("is_running",   False)
+                        any_alert = has_fall or in_crowd or loiter or running
+
+                        # Count each alert only on rising edge (False → True)
+                        prev = _alert_active.get(tid, set())
+                        cur  = set()
+                        if has_fall  and "FALL"      not in prev: event_counts["FALL"]      += 1
+                        if in_crowd  and "CROWD"     not in prev: event_counts["CROWD"]     += 1
+                        if loiter    and "LOITERING" not in prev: event_counts["LOITERING"] += 1
+                        if running   and "RUNNING"   not in prev: event_counts["RUNNING"]   += 1
+                        if has_fall:  cur.add("FALL")
+                        if in_crowd:  cur.add("CROWD")
+                        if loiter:    cur.add("LOITERING")
+                        if running:   cur.add("RUNNING")
+                        _alert_active[tid] = cur
+
+                        color = (UI.FALL  if has_fall  else
+                                 UI.CROWD if in_crowd  else
+                                 UI.ALERT if (loiter or running) else UI.WATCHING)
+                        UI.corner_mark(frame, x1,y1,x2,y2, color,
+                                       length=16 if any_alert else 10,
+                                       thickness=2 if any_alert else 1)
+                        if has_fall:
+                            UI.alert_badge(frame, "FALL DETECTED",   x1, y1-10, UI.FALL)
+                        elif in_crowd:
+                            UI.alert_badge(frame, "CROWD ALERT",     x1, y1-10, UI.CROWD)
+                        elif loiter:
+                            UI.alert_badge(frame, "LOITERING",       x1, y1-10, UI.ALERT)
+                        elif running:
+                            UI.alert_badge(frame, "RUNNING ALERT",   x1, y1-10, UI.ALERT)
+
+                UI.draw_hud(frame, frame_count, fps, active_alerts, device=device)
+
+                pct    = min(int((frame_count / total_frames) * 99), 99)
+                ts_str = f"Frame {frame_count} / {total_frames}"
+
+                # Push frame to canvas on main thread
+                self.after(0, lambda f=frame.copy(), t=ts_str:
+                           self._anomaly_push_frame(f, t))
+                self.after(0, lambda p=pct: self._anomaly_update_progress(p))
+
+                if frame_count % 30 == 0:
+                    self.after(0, lambda ec=dict(event_counts):
+                               self._anomaly_update_counters(ec))
+                if frame_count % 60 == 0:
+                    self.after(0, self._anomaly_refresh_log)
+
+            cap.release()
+            for mod in (panic_det, fall_det, loiter_det):
+                mod.release()
+            logger.shutdown()
+
+            total_ev = sum(event_counts.values())
+            self.after(0, lambda: self._anomaly_update_progress(100))
+            self.after(0, lambda: self.anomaly_phase_lbl.config(
+                text=f"[ COMPLETE  —  {total_ev} events ]", fg=ACCENT_GREEN))
+            self.after(0, lambda: self._set_sidebar_status(
+                "done", f"Anomaly done — {total_ev} events"))
+            self.after(0, lambda ec=dict(event_counts):
+                       self._anomaly_update_counters(ec))
+            self.after(0, self._anomaly_refresh_log)
+            if hasattr(self, "_tab_count_labels") and "anomaly" in self._tab_count_labels:
+                self.after(0, lambda: self._tab_count_labels["anomaly"].config(
+                    text=str(len(self._scan_anomaly_results()))))
+
+        except Exception as e:
+            import traceback
+            tb = traceback.format_exc()
+            self.after(0, lambda err=str(e): messagebox.showerror(
+                "Anomaly Error", f"Detection failed:\n{err}"))
+            print(tb)
+        finally:
+            self.after(0, lambda: self.anomaly_start_btn.config(
+                state="normal", bg=ACCENT_GREEN))
+            self.after(0, lambda: self.anomaly_stop_btn.config(state="disabled"))
+            self.anomaly_is_running = False
+
+    # ── Frame push (main thread) ────────────────────────────────────────
+    def _anomaly_push_frame(self, bgr_frame, ts_str):
+        """Render a detection frame onto the canvas (not draw mode)."""
+        if self.anomaly_draw_mode:
+            return
+        cw = self.anomaly_canvas.winfo_width()  or 800
+        ch = self.anomaly_canvas.winfo_height() or 450
+        img = Image.fromarray(cv2.cvtColor(bgr_frame, cv2.COLOR_BGR2RGB))
+        img = img.resize((cw, ch), Image.LANCZOS)
+        img_tk = ImageTk.PhotoImage(img)
+        self.anomaly_canvas.delete("all")
+        self.anomaly_canvas.create_image(0, 0, anchor="nw", image=img_tk, tags="frame")
+        self._anomaly_img_tk = img_tk
+        self.anomaly_frame_lbl.config(text=ts_str)
+
+    # ── Misc updates ────────────────────────────────────────────────────
+    def _anomaly_update_progress(self, value):
+        self.anomaly_prog["value"] = value
+        color = ACCENT_CYAN if value < 100 else ACCENT_GREEN
+        self.anomaly_prog_lbl.config(text=f"{value}%", fg=color)
+
+    def _anomaly_update_counters(self, counts):
+        for key, lbl in self.anomaly_counters.items():
+            lbl.config(text=str(counts.get(key, 0)))
+
+    def _anomaly_refresh_log(self):
+        """Reload security_logs.csv and display newest entries."""
+        import csv as _csv
+        path = self.anomaly_log_path
+        if not os.path.isfile(path):
+            return
+        try:
+            rows = []
+            with open(path, newline="") as f:
+                rows = list(_csv.reader(f))
+            display = rows[1:][-60:]   # skip header, last 60
+            self.anomaly_log_listbox.delete(0, "end")
+            if not display:
+                self.anomaly_log_listbox.insert("end", "  No events logged yet.")
+                return
+            for row in reversed(display):
+                if len(row) >= 4:
+                    ts, tid, event, status = row[0], row[1], row[2], row[3]
+                    self.anomaly_log_listbox.insert(
+                        "end", f"  {ts}  ID:{tid}  {event}  [{status}]")
+                    idx = self.anomaly_log_listbox.size() - 1
+                    ev = event.upper()
+                    fg = ("#ff4757" if "FALL"   in ev else
+                          "#ffa502" if "CROWD"  in ev else
+                          "#00e5ff" if "LOITER" in ev else
+                          "#ffa502" if "RUN"    in ev else
+                          "#7a8fa8")
+                    self.anomaly_log_listbox.itemconfig(idx, fg=fg)
+        except Exception:
+            pass
+
     def show_page(self, name):
         self.is_running = False # Gracefully stop active threads
         
         # Hide all frames
         for page in [self.home_page, self.reid_page, self.analytics_page,
-                     self.zone_page, self.results_page, self.suspect_page]:
+                     self.zone_page, self.results_page, self.suspect_page,
+                     self.anomaly_page]:
             page.pack_forget()
 
         self._set_active_nav(name)
@@ -900,6 +1670,9 @@ class SentinelVision(tk.Tk):
             self._refresh_results_page()
         elif name == "Suspect":
             self.suspect_page.pack(fill="both", expand=True)
+        elif name == "Anomaly":
+            self.anomaly_page.pack(fill="both", expand=True)
+            self._anomaly_refresh_log()
     # ------------------------------------------------------------------ #
     #  CLICK HANDLING                                                      #
     # ------------------------------------------------------------------ #
@@ -1083,6 +1856,7 @@ class SentinelVision(tk.Tk):
         self._tab_count_labels["zones"].config(text=str(len(self._scan_zone_results())))
         self._tab_count_labels["heatmaps"].config(text=str(len(self._scan_heatmap_results())))
         self._tab_count_labels["suspect"].config(text=str(len(self._scan_suspect_results())))
+        self._tab_count_labels["anomaly"].config(text=str(len(self._scan_anomaly_results())))
         # Load the currently active tab
         self._load_tab_items(self._active_results_tab)
 
